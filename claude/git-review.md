@@ -1,4 +1,4 @@
-First, ensure `Read(~/.git-review)` is in `permissions.allow` in `~/.claude/settings.json` — add it if missing. Tell the user: "Adding permission to read ~/.git-review — you'll be asked to approve this once, then it will be automatic in future sessions." Then read the file `~/.git-review` using the Read tool.
+Read the file `~/.git-review` using the Read tool.
 
 The file contains a list of annotated code snippets produced by `git-review`. Each entry has this format:
 

@@ -7,6 +7,8 @@
 # ]
 # ///
 
+__version__ = "0.1.3"
+
 import re
 import subprocess
 import sys
@@ -80,10 +82,11 @@ class DiffLine:
 class Comment:
     file_index: int
     filename: str
-    line_index: int
+    diff_line_index: int | None  # index into diff-view parsed lines; -1 = line not in diff
+    full_line_index: int | None  # index into full-view parsed lines; -1 = line not in full
     src_num: int | None
     dst_num: int | None
-    context_before: list[str]
+    context_before: list[str]   # frozen at save time
     context_after: list[str]
     text: str
 
@@ -128,12 +131,14 @@ def parse_lines(content: str) -> list[DiffLine]:
 
 
 class CommentArea(TextArea):
-    """TextArea subclass that intercepts save/discard keys before TextArea sees them.
+    """TextArea for comment input. Enter/ctrl+s/escape submit; shift+enter inserts newline."""
 
-    Textual calls _on_key handlers in MRO order within its dispatch loop.
-    Calling event.stop() here prevents TextArea._on_key from running, so the
-    key is not inserted as text. Keys we don't handle fall through to TextArea.
-    """
+    BINDINGS = [
+        Binding("enter", "submit_comment", priority=True, show=False),
+        Binding("ctrl+s", "submit_comment", priority=True, show=False),
+        Binding("escape", "submit_comment", priority=True, show=False),
+        Binding("ctrl+c", "discard_comment", priority=True, show=False),
+    ]
 
     class Submit(Message):
         pass
@@ -142,13 +147,42 @@ class CommentArea(TextArea):
         pass
 
     def _on_key(self, event: events.Key) -> None:
-        if event.key in ("escape", "ctrl+s", "ctrl+enter"):
-            self.post_message(self.Submit())
+        if event.key == "shift+enter":
+            self.insert("\n")
             event.stop()
-        elif event.key == "ctrl+c":
-            self.post_message(self.Discard())
+
+    def action_submit_comment(self) -> None:
+        self.post_message(self.Submit())
+
+    def action_discard_comment(self) -> None:
+        self.post_message(self.Discard())
+
+
+class SummaryArea(TextArea):
+    """Full-height editable TextArea for revising the review summary."""
+
+    BINDINGS = [
+        Binding("ctrl+s", "submit_summary", priority=True, show=False),
+        Binding("escape", "submit_summary", priority=True, show=False),
+        Binding("ctrl+c", "discard_summary", priority=True, show=False),
+    ]
+
+    class Submit(Message):
+        pass
+
+    class Discard(Message):
+        pass
+
+    def _on_key(self, event: events.Key) -> None:
+        if event.key == "shift+enter":
+            self.insert("\n")
             event.stop()
-        # All other keys (enter, shift+enter, letters, …): let TextArea handle them.
+
+    def action_submit_summary(self) -> None:
+        self.post_message(self.Submit())
+
+    def action_discard_summary(self) -> None:
+        self.post_message(self.Discard())
 
 
 class DiffView(ScrollableContainer):
@@ -161,11 +195,6 @@ class DiffView(ScrollableContainer):
     def allow_horizontal_scroll(self) -> bool:
         return False
 
-    class LineClicked(Message):
-        def __init__(self, line_index: int) -> None:
-            super().__init__()
-            self.line_index = line_index
-
     def scroll_up(self, **kwargs) -> None:
         super().scroll_up(animate=False)
 
@@ -173,10 +202,10 @@ class DiffView(ScrollableContainer):
         super().scroll_down(animate=False)
 
     def scroll_page_up(self, **kwargs) -> None:
-        super().scroll_page_up(animate=False)
+        self.scroll_y = max(0, self.scroll_y - self.size.height)
 
     def scroll_page_down(self, **kwargs) -> None:
-        super().scroll_page_down(animate=False)
+        self.scroll_y = self.scroll_y + self.size.height
 
     def compose(self) -> ComposeResult:
         yield Static("", id="diff-content", expand=True)
@@ -196,12 +225,9 @@ class DiffView(ScrollableContainer):
         elif line_index >= cur + height:
             self.scroll_y = line_index - height + 1
 
-    def on_click(self, event: events.Click) -> None:
-        line_index = int(self.scroll_y) + event.y
-        self.post_message(self.LineClicked(line_index))
-
 
 class DiffPager(App):
+    MOUSE_SUPPORT = False
     CSS = """
     Horizontal#title {
         height: 1;
@@ -213,6 +239,9 @@ class DiffPager(App):
     }
     Horizontal#title.comment-mode {
         background: darkred;
+    }
+    Horizontal#title.revise-mode {
+        background: darkorange;
     }
     Label#title-file {
         width: 1fr;
@@ -243,6 +272,11 @@ class DiffPager(App):
     }
     CommentArea {
         height: 6;
+        display: none;
+        border: tall $primary;
+    }
+    SummaryArea {
+        height: 1fr;
         display: none;
         border: tall $primary;
     }
@@ -277,8 +311,8 @@ class DiffPager(App):
     """
 
     BINDINGS = [
-        Binding("left", "prev_file", "Prev File", priority=True),
-        Binding("right", "next_file", "Next File", priority=True),
+        Binding("left", "prev_file", "Prev File"),
+        Binding("right", "next_file", "Next File"),
         Binding("f", "full_file", "Full File"),
         Binding("l", "toggle_line_nums", "Line #s", show=False),
         Binding("r", "toggle_review", "Review", show=False),
@@ -287,8 +321,8 @@ class DiffPager(App):
         Binding("down", "review_down", "Down", priority=True, show=False),
         Binding("pageup", "review_pgup", "PgUp", priority=True, show=False),
         Binding("pagedown", "review_pgdn", "PgDn", priority=True, show=False),
+        Binding("tab", "enter_comment", "Comment", priority=True, show=False),
         Binding("enter", "enter_comment", "Comment", show=False),
-        Binding("w", "write_review", "Write", show=False),
         Binding("c", "copy_review", "Copy", show=False),
         Binding("colon", "jump", "Jump to file", show=False),
         Binding("q", "quit", "Quit"),
@@ -304,6 +338,8 @@ class DiffPager(App):
         self._review_mode = False
         self._review_line = 0
         self._comment_mode = False
+        self._revise_mode = False
+        self._summary_text_override: str | None = None
         self._show_line_nums = False
         self._comments: list[Comment] = []
         self._parsed_lines: list[DiffLine] = []
@@ -313,15 +349,16 @@ class DiffPager(App):
             yield Label("", id="title-file")
             yield Label("", id="title-info")
         yield DiffView()
+        yield SummaryArea("", id="summary-input")
         yield Label("", id="comment-label")
         yield CommentArea("", id="comment-input")
         yield Input(placeholder="", id="jump")
         with Horizontal(id="summary-actions"):
-            yield Button("[bold]W[/bold]rite to claude", id="btn-write", classes="summary-btn")
+            yield Button("[bold]W[/bold]rite + quit", id="btn-write", classes="summary-btn")
             yield Button("[bold]C[/bold]opy to clipboard", id="btn-copy", classes="summary-btn")
         with Horizontal(id="footer"):
             yield Label("", id="footer-status")
-            yield Label("[bold]R[/bold]eview  [bold]L[/bold]ines  [bold]F[/bold]ull  [bold]Q[/bold]uit", id="footer-keys")
+            yield Label("[bold]R[/bold]eview  [bold]L[/bold]ines  [bold]F[/bold]ull  [bold]W[/bold]rite  [bold]Q[/bold]uit", id="footer-keys")
 
     def on_mount(self) -> None:
         self.query_one(DiffView).focus()
@@ -329,12 +366,39 @@ class DiffPager(App):
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
+    def _find_line_by_num(self, src_num: int | None, dst_num: int | None) -> int:
+        """Find the index in current _parsed_lines matching src_num or dst_num. Returns -1 if absent."""
+        for i, dl in enumerate(self._parsed_lines):
+            if src_num is not None and dl.src_num == src_num:
+                return i
+            if dst_num is not None and dl.dst_num == dst_num:
+                return i
+        return -1
+
+    def _resolve_line_index(self, c: Comment) -> int:
+        """Return this comment's line index for the current view, calculating and caching if needed."""
+        if self._full_view:
+            if c.full_line_index is None:
+                c.full_line_index = self._find_line_by_num(c.src_num, c.dst_num)
+            return c.full_line_index
+        else:
+            if c.diff_line_index is None:
+                c.diff_line_index = self._find_line_by_num(c.src_num, c.dst_num)
+            return c.diff_line_index
+
     def _comment_indices_for_file(self) -> set[int]:
-        return {c.line_index for c in self._comments if c.file_index == self._index}
+        indices = set()
+        for c in self._comments:
+            if c.file_index != self._index:
+                continue
+            idx = self._resolve_line_index(c)
+            if idx >= 0:
+                indices.add(idx)
+        return indices
 
     def _get_comment_for_line(self, line_idx: int) -> Comment | None:
         for c in self._comments:
-            if c.file_index == self._index and c.line_index == line_idx:
+            if c.file_index == self._index and self._resolve_line_index(c) == line_idx:
                 return c
         return None
 
@@ -392,24 +456,30 @@ class DiffPager(App):
 
     def _update_title_style(self) -> None:
         title = self.query_one("#title", Horizontal)
-        title.remove_class("review", "comment-mode")
-        if self._comment_mode:
+        title.remove_class("review", "comment-mode", "revise-mode")
+        if self._revise_mode:
+            title.add_class("revise-mode")
+        elif self._comment_mode:
             title.add_class("comment-mode")
         elif self._review_mode:
             title.add_class("review")
 
         status = self.query_one("#footer-status", Label)
-        if self._comment_mode:
-            status.update("Commenting... (Ctrl+S / Esc save · Ctrl+C discard)")
+        if self._revise_mode:
+            status.update("Editing summary... (Ctrl+S / Esc save · Ctrl+C discard)")
+        elif self._comment_mode:
+            status.update("Commenting... (Enter save · Shift+Enter newline · Ctrl+C discard)")
         elif self._review_mode:
             status.update("Reviewing... (Enter comment · ←→ files · r/Esc exit)")
         else:
             status.update("")
 
     def _build_summary_text(self) -> str:
+        if self._summary_text_override is not None:
+            return self._summary_text_override
         parts = ["Review Summary\n==============\n"]
         for c in self._comments:
-            line_ref = c.src_num or c.dst_num or c.line_index
+            line_ref = c.src_num or c.dst_num or c.diff_line_index or c.full_line_index
             parts.append(f"\n--- {c.filename} (line ~{line_ref})\n")
             for ctx in c.context_before:
                 parts.append(f"    {ctx}\n")
@@ -429,7 +499,10 @@ class DiffPager(App):
         self._full_view = False
         self._review_mode = False
         self._comment_mode = False
+        self._revise_mode = False
         self._review_line = 0
+        self.query_one("#summary-input", SummaryArea).display = False
+        self.query_one(DiffView).display = True
         filename, content = self.files[index]
         self._parsed_lines = parse_lines(content)
         n = len(self.files)
@@ -484,21 +557,20 @@ class DiffPager(App):
         ta = self.query_one("#comment-input", CommentArea)
         if save:
             text = ta.text.strip()
-            # Remove existing comment for this line
-            self._comments = [
-                c for c in self._comments
-                if not (c.file_index == self._index and c.line_index == self._review_line)
-            ]
+            existing = self._get_comment_for_line(self._review_line)
+            if existing:
+                self._comments.remove(existing)
             if text:
                 dl = self._parsed_lines[self._review_line] if self._parsed_lines else None
                 lines = self._parsed_lines
                 idx = self._review_line
-                before = [lines[i].plain for i in range(max(0, idx - 3), idx)]
+                before = [lines[i].plain for i in range(max(0, idx - 3), idx + 1)]
                 after = [lines[i].plain for i in range(idx + 1, min(len(lines), idx + 4))]
                 self._comments.append(Comment(
                     file_index=self._index,
                     filename=self.files[self._index][0],
-                    line_index=idx,
+                    diff_line_index=idx if not self._full_view else None,
+                    full_line_index=idx if self._full_view else None,
                     src_num=dl.src_num if dl else None,
                     dst_num=dl.dst_num if dl else None,
                     context_before=before,
@@ -514,6 +586,25 @@ class DiffPager(App):
         self.query_one(DiffView).focus()
         self._refresh_view()
 
+    def _enter_revise_mode(self) -> None:
+        self._revise_mode = True
+        sa = self.query_one("#summary-input", SummaryArea)
+        self.query_one(DiffView).display = False
+        sa.load_text(self._build_summary_text())
+        sa.display = True
+        sa.focus()
+        self._update_title_style()
+
+    def _exit_revise_mode(self, save: bool) -> None:
+        sa = self.query_one("#summary-input", SummaryArea)
+        if save:
+            self._summary_text_override = sa.text
+        sa.display = False
+        sa.load_text("")
+        self._revise_mode = False
+        self.query_one(DiffView).display = True
+        self._show_summary_page()
+
     def on_comment_area_submit(self, event: CommentArea.Submit) -> None:
         if self._comment_mode:
             self._exit_comment_mode(save=True)
@@ -522,19 +613,41 @@ class DiffPager(App):
         if self._comment_mode:
             self._exit_comment_mode(save=False)
 
+    def on_summary_area_submit(self, event: SummaryArea.Submit) -> None:
+        if self._revise_mode:
+            self._exit_revise_mode(save=True)
+
+    def on_summary_area_discard(self, event: SummaryArea.Discard) -> None:
+        if self._revise_mode:
+            self._exit_revise_mode(save=False)
+
     # ── Event handlers ─────────────────────────────────────────────────────
 
     def on_key(self, event: events.Key) -> None:
         # In comment mode CommentArea handles save/discard via its own _on_key.
         # We still need to stop App-level bindings (w, c, r, q, etc.) from firing
         # while the user is typing a comment.
-        if self._comment_mode:
+        if self._comment_mode or self._revise_mode:
             event.stop()
             return
 
         # Space in review mode = enter comment
         if event.key == "space" and self._review_mode and not self._on_summary_page():
             self._enter_comment_mode()
+            event.stop()
+            return
+
+        # w in normal/review mode = save current comments (no quit)
+        if event.key == "w" and not self._on_summary_page():
+            if self._comments or self._summary_text_override is not None:
+                dest = Path.home() / ".git-review"
+                text = self._build_summary_text()
+                current_file = self.files[self._index][0]
+                text = text.rstrip("\n") + f"\n\n# (reviewed to {current_file})\n"
+                dest.write_text(text)
+                self.query_one("#footer-status", Label).update("Saved to ~/.git-review")
+            else:
+                self.query_one("#footer-status", Label).update("No comments to write")
             event.stop()
             return
 
@@ -551,17 +664,6 @@ class DiffPager(App):
                 return
             self.exit()
             event.stop()
-
-    def on_diff_view_line_clicked(self, event: DiffView.LineClicked) -> None:
-        if self._on_summary_page() or not self._parsed_lines:
-            return
-        line_index = max(0, min(event.line_index, len(self._parsed_lines) - 1))
-        was_in_review = self._review_mode
-        self._review_mode = True
-        self._review_line = line_index
-        if not was_in_review:
-            self._update_title_style()
-        self._refresh_view()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         jump = self.query_one("#jump", Input)
@@ -583,12 +685,16 @@ class DiffPager(App):
     # ── Actions ────────────────────────────────────────────────────────────
 
     def action_prev_file(self) -> None:
+        if self._comment_mode or self._revise_mode:
+            return
         if self._on_summary_page():
             self._show_file(len(self.files) - 1)
         elif self._index > 0:
             self._show_file(self._index - 1)
 
     def action_next_file(self) -> None:
+        if self._comment_mode or self._revise_mode:
+            return
         if self._on_summary_page():
             return
         if self._index < len(self.files) - 1:
@@ -625,6 +731,8 @@ class DiffPager(App):
 
     def action_toggle_review(self) -> None:
         if self._on_summary_page():
+            if not self._revise_mode:
+                self._enter_revise_mode()
             return
         if self._comment_mode:
             self._exit_comment_mode(save=False)
@@ -641,21 +749,27 @@ class DiffPager(App):
         self._refresh_view()
 
     def action_review_up(self) -> None:
-        if self._review_mode and not self._comment_mode and self._parsed_lines:
+        if self._comment_mode:
+            return
+        if self._review_mode and self._parsed_lines:
             self._review_line = max(0, self._review_line - 1)
             self._refresh_view()
         else:
             self.query_one(DiffView).scroll_up()
 
     def action_review_down(self) -> None:
-        if self._review_mode and not self._comment_mode and self._parsed_lines:
+        if self._comment_mode:
+            return
+        if self._review_mode and self._parsed_lines:
             self._review_line = min(len(self._parsed_lines) - 1, self._review_line + 1)
             self._refresh_view()
         else:
             self.query_one(DiffView).scroll_down()
 
     def action_review_pgup(self) -> None:
-        if self._review_mode and not self._comment_mode and self._parsed_lines:
+        if self._comment_mode:
+            return
+        if self._review_mode and self._parsed_lines:
             height = self.query_one(DiffView).size.height
             self._review_line = max(0, self._review_line - height)
             self._refresh_view()
@@ -663,7 +777,9 @@ class DiffPager(App):
             self.query_one(DiffView).scroll_page_up()
 
     def action_review_pgdn(self) -> None:
-        if self._review_mode and not self._comment_mode and self._parsed_lines:
+        if self._comment_mode:
+            return
+        if self._review_mode and self._parsed_lines:
             height = self.query_one(DiffView).size.height
             self._review_line = min(len(self._parsed_lines) - 1, self._review_line + height)
             self._refresh_view()
@@ -671,7 +787,10 @@ class DiffPager(App):
             self.query_one(DiffView).scroll_page_down()
 
     def action_enter_comment(self) -> None:
-        if not self._review_mode or self._comment_mode or self._on_summary_page():
+        if self._comment_mode or self._on_summary_page():
+            return
+        if not self._review_mode:
+            self.action_toggle_review()
             return
         self._enter_comment_mode()
 
@@ -682,14 +801,14 @@ class DiffPager(App):
         jump.focus()
 
     def action_write_review(self) -> None:
-        if not self._comments:
+        if not self._comments and self._summary_text_override is None:
             return
         dest = Path.home() / ".git-review"
         dest.write_text(self._build_summary_text())
-        self.query_one("#footer-status", Label).update(f"Written to {dest}")
+        self.exit()
 
     def action_copy_review(self) -> None:
-        if not self._comments:
+        if not self._comments and self._summary_text_override is None:
             return
         pyperclip.copy(self._build_summary_text())
         self.query_one("#footer-status", Label).update("Copied to clipboard")
