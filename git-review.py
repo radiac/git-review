@@ -7,8 +7,9 @@
 # ]
 # ///
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
+import os
 import re
 import subprocess
 import sys
@@ -89,6 +90,7 @@ class Comment:
     context_before: list[str]   # frozen at save time
     context_after: list[str]
     text: str
+    file_level: bool = False    # comment applies to whole file (added on header lines)
 
 
 def parse_lines(content: str) -> list[DiffLine]:
@@ -134,6 +136,8 @@ class CommentArea(TextArea):
     """TextArea for comment input. Enter/ctrl+s/escape submit; shift+enter inserts newline."""
 
     BINDINGS = [
+        # ctrl+j is the byte shift+enter sends in most terminals (\n, ASCII 10)
+        Binding("ctrl+j", "insert_newline", priority=True, show=False),
         Binding("enter", "submit_comment", priority=True, show=False),
         Binding("ctrl+s", "submit_comment", priority=True, show=False),
         Binding("escape", "submit_comment", priority=True, show=False),
@@ -146,10 +150,8 @@ class CommentArea(TextArea):
     class Discard(Message):
         pass
 
-    def _on_key(self, event: events.Key) -> None:
-        if event.key == "shift+enter":
-            self.insert("\n")
-            event.stop()
+    def action_insert_newline(self) -> None:
+        self.insert("\n")
 
     def action_submit_comment(self) -> None:
         self.post_message(self.Submit())
@@ -162,6 +164,7 @@ class SummaryArea(TextArea):
     """Full-height editable TextArea for revising the review summary."""
 
     BINDINGS = [
+        Binding("ctrl+j", "insert_newline", priority=True, show=False),
         Binding("ctrl+s", "submit_summary", priority=True, show=False),
         Binding("escape", "submit_summary", priority=True, show=False),
         Binding("ctrl+c", "discard_summary", priority=True, show=False),
@@ -173,10 +176,8 @@ class SummaryArea(TextArea):
     class Discard(Message):
         pass
 
-    def _on_key(self, event: events.Key) -> None:
-        if event.key == "shift+enter":
-            self.insert("\n")
-            event.stop()
+    def action_insert_newline(self) -> None:
+        self.insert("\n")
 
     def action_submit_summary(self) -> None:
         self.post_message(self.Submit())
@@ -202,10 +203,10 @@ class DiffView(ScrollableContainer):
         super().scroll_down(animate=False)
 
     def scroll_page_up(self, **kwargs) -> None:
-        self.scroll_y = max(0, self.scroll_y - self.size.height)
+        super().scroll_page_up(animate=False)
 
     def scroll_page_down(self, **kwargs) -> None:
-        self.scroll_y = self.scroll_y + self.size.height
+        super().scroll_page_down(animate=False)
 
     def compose(self) -> ComposeResult:
         yield Static("", id="diff-content", expand=True)
@@ -221,9 +222,9 @@ class DiffView(ScrollableContainer):
         height = self.size.height
         cur = int(self.scroll_y)
         if line_index < cur:
-            self.scroll_y = line_index
+            self.scroll_to(y=line_index, animate=False)
         elif line_index >= cur + height:
-            self.scroll_y = line_index - height + 1
+            self.scroll_to(y=line_index - height + 1, animate=False)
 
 
 class DiffPager(App):
@@ -319,6 +320,8 @@ class DiffPager(App):
         Binding("R", "toggle_review", "Review", show=False),
         Binding("up", "review_up", "Up", priority=True, show=False),
         Binding("down", "review_down", "Down", priority=True, show=False),
+        Binding("ctrl+up", "viewport_up", "Scroll Up", priority=True, show=False),
+        Binding("ctrl+down", "viewport_down", "Scroll Down", priority=True, show=False),
         Binding("pageup", "review_pgup", "PgUp", priority=True, show=False),
         Binding("pagedown", "review_pgdn", "PgDn", priority=True, show=False),
         Binding("tab", "enter_comment", "Comment", priority=True, show=False),
@@ -343,6 +346,7 @@ class DiffPager(App):
         self._show_line_nums = False
         self._comments: list[Comment] = []
         self._parsed_lines: list[DiffLine] = []
+        self._run_claude = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="title"):
@@ -354,11 +358,12 @@ class DiffPager(App):
         yield CommentArea("", id="comment-input")
         yield Input(placeholder="", id="jump")
         with Horizontal(id="summary-actions"):
-            yield Button("[bold]W[/bold]rite + quit", id="btn-write", classes="summary-btn")
-            yield Button("[bold]C[/bold]opy to clipboard", id="btn-copy", classes="summary-btn")
+            yield Button("[bold yellow]W[/bold yellow]rite + quit", id="btn-write", classes="summary-btn")
+            yield Button("[bold yellow]C[/bold yellow]opy to clipboard", id="btn-copy", classes="summary-btn")
+            yield Button("[bold yellow]F[/bold yellow]orward to claude", id="btn-claude", classes="summary-btn")
         with Horizontal(id="footer"):
             yield Label("", id="footer-status")
-            yield Label("[bold]R[/bold]eview  [bold]L[/bold]ines  [bold]F[/bold]ull  [bold]W[/bold]rite  [bold]Q[/bold]uit", id="footer-keys")
+            yield Label("[bold yellow]R[/bold yellow]eview  [bold yellow]L[/bold yellow]ines  [bold yellow]F[/bold yellow]ull  [bold yellow]W[/bold yellow]rite  [bold yellow]Q[/bold yellow]uit", id="footer-keys")
 
     def on_mount(self) -> None:
         self.query_one(DiffView).focus()
@@ -479,12 +484,14 @@ class DiffPager(App):
             return self._summary_text_override
         parts = ["Review Summary\n==============\n"]
         for c in self._comments:
-            line_ref = c.src_num or c.dst_num or c.diff_line_index or c.full_line_index
-            parts.append(f"\n--- {c.filename} (line ~{line_ref})\n")
-            for ctx in c.context_before:
-                parts.append(f"    {ctx}\n")
-            parts.append("---\n")
-            parts.append("\n")
+            if c.file_level:
+                parts.append(f"\n--- {c.filename} (full file)\n---\n\n")
+            else:
+                line_ref = c.src_num or c.dst_num or c.diff_line_index or c.full_line_index
+                parts.append(f"\n--- {c.filename} (line ~{line_ref})\n")
+                for ctx in c.context_before:
+                    parts.append(f"    {ctx}\n")
+                parts.append("---\n\n")
             parts.append(c.text)
             parts.append("\n\n")
         return "".join(parts)
@@ -541,10 +548,13 @@ class DiffPager(App):
         self._update_title_style()
 
         dl = self._parsed_lines[self._review_line] if self._parsed_lines else None
-        line_ref = (dl.src_num or dl.dst_num or self._review_line) if dl else self._review_line
         filename = self.files[self._index][0]
         label = self.query_one("#comment-label", Label)
-        label.update(f"Comment for {filename} line ~{line_ref}")
+        if self._review_line < 4:
+            label.update(f"Comment for {filename} (whole file)")
+        else:
+            line_ref = (dl.src_num or dl.dst_num or self._review_line) if dl else self._review_line
+            label.update(f"Comment for {filename} line ~{line_ref}")
         label.display = True
 
         existing = self._get_comment_for_line(self._review_line)
@@ -564,18 +574,26 @@ class DiffPager(App):
                 dl = self._parsed_lines[self._review_line] if self._parsed_lines else None
                 lines = self._parsed_lines
                 idx = self._review_line
-                before = [lines[i].plain for i in range(max(0, idx - 3), idx + 1)]
-                after = [lines[i].plain for i in range(idx + 1, min(len(lines), idx + 4))]
+                file_level = idx < 4
+                if file_level:
+                    before, after = [], []
+                    src_num = dst_num = None
+                else:
+                    before = [lines[i].plain for i in range(max(0, idx - 3), idx + 1)]
+                    after = [lines[i].plain for i in range(idx + 1, min(len(lines), idx + 4))]
+                    src_num = dl.src_num if dl else None
+                    dst_num = dl.dst_num if dl else None
                 self._comments.append(Comment(
                     file_index=self._index,
                     filename=self.files[self._index][0],
                     diff_line_index=idx if not self._full_view else None,
                     full_line_index=idx if self._full_view else None,
-                    src_num=dl.src_num if dl else None,
-                    dst_num=dl.dst_num if dl else None,
+                    src_num=src_num,
+                    dst_num=dst_num,
                     context_before=before,
                     context_after=after,
                     text=text,
+                    file_level=file_level,
                 ))
 
         ta.display = False
@@ -637,6 +655,18 @@ class DiffPager(App):
             event.stop()
             return
 
+        # w on summary page = write and quit
+        if event.key == "w" and self._on_summary_page():
+            self.action_write_review()
+            event.stop()
+            return
+
+        # f on summary page = write, quit, then forward to claude
+        if event.key == "f" and self._on_summary_page():
+            self.action_forward_to_claude()
+            event.stop()
+            return
+
         # w in normal/review mode = save current comments (no quit)
         if event.key == "w" and not self._on_summary_page():
             if self._comments or self._summary_text_override is not None:
@@ -681,6 +711,8 @@ class DiffPager(App):
             self.action_write_review()
         elif event.button.id == "btn-copy":
             self.action_copy_review()
+        elif event.button.id == "btn-claude":
+            self.action_forward_to_claude()
 
     # ── Actions ────────────────────────────────────────────────────────────
 
@@ -786,6 +818,30 @@ class DiffPager(App):
         else:
             self.query_one(DiffView).scroll_page_down()
 
+    def action_viewport_up(self) -> None:
+        if self._comment_mode:
+            return
+        diff_view = self.query_one(DiffView)
+        new_scroll = max(0, int(diff_view.scroll_y) - 1)
+        diff_view.scroll_to(y=new_scroll, animate=False)
+        if self._review_mode and self._parsed_lines:
+            height = diff_view.size.height
+            max_visible = new_scroll + height - 1
+            if self._review_line > max_visible:
+                self._review_line = max_visible
+            self._refresh_view()
+
+    def action_viewport_down(self) -> None:
+        if self._comment_mode:
+            return
+        diff_view = self.query_one(DiffView)
+        new_scroll = int(diff_view.scroll_y) + 1
+        diff_view.scroll_to(y=new_scroll, animate=False)
+        if self._review_mode and self._parsed_lines:
+            if self._review_line < new_scroll:
+                self._review_line = new_scroll
+            self._refresh_view()
+
     def action_enter_comment(self) -> None:
         if self._comment_mode or self._on_summary_page():
             return
@@ -805,6 +861,14 @@ class DiffPager(App):
             return
         dest = Path.home() / ".git-review"
         dest.write_text(self._build_summary_text())
+        self.exit()
+
+    def action_forward_to_claude(self) -> None:
+        if not self._comments and self._summary_text_override is None:
+            return
+        dest = Path.home() / ".git-review"
+        dest.write_text(self._build_summary_text())
+        self._run_claude = True
         self.exit()
 
     def action_copy_review(self) -> None:
@@ -830,7 +894,11 @@ def main() -> None:
         print("No files found in diff.")
         sys.exit(0)
 
-    DiffPager(files, branch, sys.argv[1:]).run()
+    app = DiffPager(files, branch, sys.argv[1:])
+    app.run()
+    if app._run_claude:
+        claude = os.environ.get("CLAUDE", "claude")
+        os.execvp(claude, [claude, "/git-review"])
 
 
 if __name__ == "__main__":

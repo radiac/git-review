@@ -39,10 +39,12 @@ git review -- path/to/file.py
 | Key | Action |
 |-----|--------|
 | `←` / `→` | Previous / next file |
-| `Space` / `↑` / `↓` / `PgUp` / `PgDn` | Scroll |
+| `↑` / `↓` / `PgUp` / `PgDn` / `Space` | Scroll |
+| `Ctrl+↑` / `Ctrl+↓` | Scroll one line |
 | `F` | Toggle full file view (expand all context) |
 | `L` | Toggle line numbers |
-| `R` | Enter / exit review mode |
+| `R` | Enter review mode |
+| `W` | Save comments to `~/.git-review` (without quitting) |
 | `Q` / `Esc` | Quit |
 | `:` | Jump to file by number |
 
@@ -52,11 +54,21 @@ Press `R` to enter review mode. The selected line is highlighted.
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` | Move selection |
-| `Enter` or `Space` | Open comment box for selected line |
+| `↑` / `↓` / `PgUp` / `PgDn` | Move selection |
+| `Ctrl+↑` / `Ctrl+↓` | Scroll viewport (selection clamps to visible area) |
+| `Enter` / `Tab` / `Space` | Open comment box for selected line |
+| `R` / `Esc` | Exit review mode |
+
+In the comment box:
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Save comment |
+| `Shift+Enter` | Insert newline |
 | `Ctrl+S` / `Esc` | Save comment |
 | `Ctrl+C` | Discard comment |
-| `R` / `Esc` | Exit review mode |
+
+Commenting on one of the top 4 header lines (the `diff --git` / `---` / `+++` block) creates a whole-file comment with no line reference.
 
 Lines with comments are marked with a `●` in the margin.
 
@@ -64,14 +76,18 @@ Lines with comments are marked with a `●` in the margin.
 
 Once you have comments, navigate to the last file and press `→` to reach the summary page. From there:
 
-- **`W`** — write review to `~/.git-review`
-- **`C`** — copy review to clipboard
+| Key | Action |
+|-----|--------|
+| `R` | Edit / revise the summary text |
+| `W` | Write review to `~/.git-review` and quit |
+| `C` | Copy review to clipboard |
+| `F` | Write review and launch `claude /git-review` immediately |
 
-The exported format is structured for an LLM: each comment includes the filename, approximate line number, and surrounding context so LLMs can locate and implement each change.
+The exported format is structured for an LLM: each comment includes the filename, approximate line number, and surrounding context so Claude can locate and implement each change.
 
 ## Claude integration
 
-After writing the review, use the `/git-review` Claude command to apply the changes:
+From the summary page, press `F` to write the review and immediately launch Claude with the `/git-review` command. Or write it manually with `W` and run it yourself:
 
 ```
 /git-review

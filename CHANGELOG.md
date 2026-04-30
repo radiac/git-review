@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4
+
+- **Shift+Enter now actually works** — most terminals send `ctrl+j` for Shift+Enter; the binding now targets that directly so inserting a newline in the comment box works as expected.
+- **File-level comments** — commenting while on one of the top 4 header lines (the `diff --git` / `---` / `+++` block) creates a whole-file comment. These render as `--- file.py (full file)` in the review output with no line-context snippet, and the comment label shows "(whole file)" while editing.
+- **Forward to Claude** — pressing `F` on the summary page (or the new button) writes the review to `~/.git-review` and immediately launches `claude /git-review`.
+- **Ctrl+Up / Ctrl+Down scroll the viewport** independently of the review cursor — the cursor clamps to the visible area rather than scrolling with the viewport.
+- **Scroll fixes** — page-up/down and `ensure_line_visible` now use `scroll_to(animate=False)` instead of direct `scroll_y` assignment, fixing jerky/incorrect scroll positions.
+
 ## 0.1.3
 
 - **Shift+Enter now reliably inserts a newline** in the comment box — switched from `_on_key` interception to Textual's `BINDINGS` system so `enter` is bound to submit and `shift+enter` falls through to TextArea's natural newline handling.
