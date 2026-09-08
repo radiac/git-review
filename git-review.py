@@ -741,14 +741,22 @@ class DiffPager(App):
         if self._full_view:
             self._show_file(self._index)
             return
-        filename, _ = self.files[self._index]
+        filename, content = self.files[self._index]
         base_args = []
         for arg in self.diff_args:
             if arg == "--":
                 break
             base_args.append(arg)
+        header_line = content.splitlines()[0] if content else ""
+        match = re.match(r"diff --git a/(.*?) b/(.*)", ANSI_ESCAPE.sub("", header_line))
+        if match and match.group(1) != match.group(2):
+            # Renamed file: pass both paths, otherwise git's pathspec pruning
+            # sees only one side and reports a plain delete/add instead of a rename.
+            pathspecs = [match.group(1), match.group(2)]
+        else:
+            pathspecs = [filename]
         result = subprocess.run(
-            ["git", "diff", "--color=always", "-U99999", *base_args, "--", filename],
+            ["git", "diff", "--color=always", "-U99999", *base_args, "--", *pathspecs],
             capture_output=True, text=True,
         )
         content = result.stdout
