@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.5
+
+- **Untracked files are now included in the review** — new (non-ignored) files are appended after the regular diff, synthesized against `/dev/null` so they show up as all-added content with correct line numbers, full-file view, and commenting. Respects any `-- pathspec` passed to `git review`.
+- **File-level header detection is now computed per file** instead of assuming a fixed 4-line preamble, so commenting near the top of a new-file diff (which has an extra `new file mode` line) correctly counts as a whole-file comment.
+
 ## 0.1.4
 
 - **Shift+Enter now actually works** — most terminals send `ctrl+j` for Shift+Enter; the binding now targets that directly so inserting a newline in the comment box works as expected.

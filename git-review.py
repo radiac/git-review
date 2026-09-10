@@ -7,7 +7,7 @@
 # ]
 # ///
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 import os
 import re
@@ -41,6 +41,27 @@ def get_branch() -> str:
 def get_diff(args: list[str]) -> str:
     result = subprocess.run(
         ["git", "diff", "--color=always", *args],
+        capture_output=True, text=True,
+    )
+    return result.stdout
+
+
+def get_untracked_files(diff_args: list[str]) -> list[str]:
+    """List untracked, non-ignored files, honouring any `-- pathspec` in diff_args."""
+    pathspec = []
+    if "--" in diff_args:
+        pathspec = diff_args[diff_args.index("--") + 1:]
+    cmd = ["git", "ls-files", "--others", "--exclude-standard"]
+    if pathspec:
+        cmd += ["--", *pathspec]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def get_untracked_diff(path: str) -> str:
+    """Synthesize a diff for an untracked file by diffing it against /dev/null."""
+    result = subprocess.run(
+        ["git", "diff", "--no-index", "--color=always", "--", "/dev/null", path],
         capture_output=True, text=True,
     )
     return result.stdout
@@ -91,6 +112,19 @@ class Comment:
     context_after: list[str]
     text: str
     file_level: bool = False    # comment applies to whole file (added on header lines)
+
+
+def compute_header_len(lines: list[DiffLine]) -> int:
+    """Number of leading lines that belong to the diff/file header, before the first hunk.
+
+    Comments made on a header line are treated as whole-file comments. The header is
+    usually 4 lines (diff --git / index / --- / +++) but new-file diffs add a "new file
+    mode" line, so this is computed per-file rather than assumed to be a fixed length.
+    """
+    for i, dl in enumerate(lines):
+        if dl.kind == "hunk":
+            return i
+    return len(lines)
 
 
 def parse_lines(content: str) -> list[DiffLine]:
@@ -331,11 +365,18 @@ class DiffPager(App):
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, files: list[tuple[str, str]], branch: str, diff_args: list[str]):
+    def __init__(
+        self,
+        files: list[tuple[str, str]],
+        branch: str,
+        diff_args: list[str],
+        untracked_files: set[str] | None = None,
+    ):
         super().__init__()
         self.files = files
         self.branch = branch
         self.diff_args = diff_args
+        self._untracked_files = untracked_files or set()
         self._index = 0
         self._full_view = False
         self._review_mode = False
@@ -346,6 +387,7 @@ class DiffPager(App):
         self._show_line_nums = False
         self._comments: list[Comment] = []
         self._parsed_lines: list[DiffLine] = []
+        self._header_len = 4
         self._run_claude = False
 
     def compose(self) -> ComposeResult:
@@ -512,6 +554,7 @@ class DiffPager(App):
         self.query_one(DiffView).display = True
         filename, content = self.files[index]
         self._parsed_lines = parse_lines(content)
+        self._header_len = compute_header_len(self._parsed_lines)
         n = len(self.files)
         self.query_one("#title-file", Label).update(f"[bold]{filename}[/bold]")
         self._update_file_info()
@@ -550,7 +593,7 @@ class DiffPager(App):
         dl = self._parsed_lines[self._review_line] if self._parsed_lines else None
         filename = self.files[self._index][0]
         label = self.query_one("#comment-label", Label)
-        if self._review_line < 4:
+        if self._review_line < self._header_len:
             label.update(f"Comment for {filename} (whole file)")
         else:
             line_ref = (dl.src_num or dl.dst_num or self._review_line) if dl else self._review_line
@@ -574,7 +617,7 @@ class DiffPager(App):
                 dl = self._parsed_lines[self._review_line] if self._parsed_lines else None
                 lines = self._parsed_lines
                 idx = self._review_line
-                file_level = idx < 4
+                file_level = idx < self._header_len
                 if file_level:
                     before, after = [], []
                     src_num = dst_num = None
@@ -742,6 +785,12 @@ class DiffPager(App):
             self._show_file(self._index)
             return
         filename, _ = self.files[self._index]
+        if filename in self._untracked_files:
+            # Untracked files are diffed against /dev/null, so the diff view already
+            # contains the whole file — there's no extra context to expand.
+            self._full_view = True
+            self._update_file_info()
+            return
         base_args = []
         for arg in self.diff_args:
             if arg == "--":
@@ -754,6 +803,7 @@ class DiffPager(App):
         content = result.stdout
         self._full_view = True
         self._parsed_lines = parse_lines(content)
+        self._header_len = compute_header_len(self._parsed_lines)
         self._update_file_info()
         self._refresh_view(scroll_home=True)
 
@@ -883,18 +933,23 @@ class DiffPager(App):
 
 def main() -> None:
     branch = get_branch()
-    diff_output = get_diff(sys.argv[1:])
+    diff_args = sys.argv[1:]
+    diff_output = get_diff(diff_args)
 
-    if not diff_output.strip():
+    untracked_paths = get_untracked_files(diff_args)
+    untracked_diff = "".join(get_untracked_diff(path) for path in untracked_paths)
+
+    combined_output = diff_output + untracked_diff
+    if not combined_output.strip():
         print("No diff output.")
         sys.exit(0)
 
-    files = parse_diff(diff_output)
+    files = parse_diff(combined_output)
     if not files:
         print("No files found in diff.")
         sys.exit(0)
 
-    app = DiffPager(files, branch, sys.argv[1:])
+    app = DiffPager(files, branch, diff_args, untracked_files=set(untracked_paths))
     app.run()
     if app._run_claude:
         claude = os.environ.get("CLAUDE", "claude")

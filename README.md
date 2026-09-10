@@ -34,6 +34,10 @@ git review main..feature-branch
 git review -- path/to/file.py
 ```
 
+Untracked (new, non-ignored) files are appended after the regular diff, shown as
+all-added content, so you can review and comment on them too. If you pass a `--
+pathspec`, only untracked files matching it are included.
+
 ## Navigation
 
 | Key | Action |
@@ -68,7 +72,7 @@ In the comment box:
 | `Ctrl+S` / `Esc` | Save comment |
 | `Ctrl+C` | Discard comment |
 
-Commenting on one of the top 4 header lines (the `diff --git` / `---` / `+++` block) creates a whole-file comment with no line reference.
+Commenting on one of the header lines (the `diff --git` / `---` / `+++` block, before the first `@@` hunk) creates a whole-file comment with no line reference.
 
 Lines with comments are marked with a `●` in the margin.
 
