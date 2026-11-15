@@ -10,7 +10,9 @@
 
 __version__ = "0.2.0"
 
+import json
 import os
+import tempfile
 import re
 import shlex
 from bisect import bisect_left
@@ -75,6 +77,105 @@ def get_untracked_diff(path: str) -> str:
         capture_output=True, text=True,
     )
     return result.stdout
+
+
+BLAME_W = 18    # "abc1234 Firstname "
+_BLAME_COLOURS = ["cyan", "magenta", "green", "yellow", "blue", "bright_red"]
+
+
+def _rev_ok(rev: str) -> bool:
+    return subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", rev + "^{commit}"],
+        capture_output=True, text=True,
+    ).returncode == 0
+
+
+def blame_revs(diff_args: list[str]) -> tuple[str, str | None]:
+    """(old, new) revisions a diff compares, for blame. new is None for the working tree.
+
+    Reads the revision arguments of `git diff` (A, A B, A..B, A...B, --cached [A]); anything
+    that isn't a revision, such as a path given without `--`, is ignored. Staged changes
+    (no revision, or --cached) are approximated by HEAD and the working tree.
+    """
+    args = diff_args[:diff_args.index("--")] if "--" in diff_args else diff_args
+    revs = [a for a in args if not a.startswith("-")]
+    if len(revs) == 1 and "..." in revs[0]:
+        left, right = (part or "HEAD" for part in revs[0].split("...", 1))
+        base = subprocess.run(["git", "merge-base", left, right], capture_output=True, text=True)
+        return (base.stdout.strip() or left), right
+    if len(revs) == 1 and ".." in revs[0]:
+        left, right = (part or "HEAD" for part in revs[0].split("..", 1))
+        return left, right
+    revs = [r for r in revs if _rev_ok(r)]
+    if len(revs) >= 2:
+        return revs[0], revs[1]
+    if revs:
+        return revs[0], None
+    return "HEAD", None
+
+
+PREF_KEYS = ("full", "line_nums", "split", "highlight", "blame", "sidebar")
+
+
+def config_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(base) if base else Path.home() / ".config"
+    return root / "git-review" / "git-review.json"
+
+
+def load_prefs() -> dict[str, bool]:
+    try:
+        data = json.loads(config_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: data[k] for k in PREF_KEYS if isinstance(data.get(k), bool)}
+
+
+def save_prefs(**changes: bool) -> None:
+    """Merge changes into the config file.
+
+    Re-reads the file each time and only touches the keys that changed, so
+    concurrent instances don't clobber each other's other toggles (latest wins
+    per toggle). Written atomically; failures are ignored.
+    """
+    path = config_path()
+    data = load_prefs()
+    data.update(changes)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".git-review-", suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def get_blame(path: str, rev: str | None = None) -> dict[int, tuple[str, str]]:
+    """Blame a file (the working tree, or at `rev`) -> {line number: (full sha, author)}.
+
+    Empty on failure.
+    """
+    result = subprocess.run(
+        ["git", "blame", "--line-porcelain", *([rev] if rev else []), "--", path],
+        capture_output=True, text=True,
+    )
+    out: dict[int, tuple[str, str]] = {}
+    if result.returncode != 0:
+        return out
+    sha, line, author = "", 0, ""
+    for raw in result.stdout.splitlines():
+        if raw.startswith("\t"):
+            out[line] = (sha, author)
+        elif re.match(r"[0-9a-f]{40} \d+ \d+", raw):
+            parts = raw.split()
+            sha, line = parts[0], int(parts[2])
+        elif raw.startswith("author "):
+            author = raw[7:]
+    return out
 
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -371,6 +472,41 @@ class DiffView(ScrollableContainer):
             self.scroll_to(y=min(line_index, end - height), animate=False)
 
 
+class Sidebar(ScrollableContainer):
+    """File list. Display only: the app tracks which file is selected."""
+
+    can_focus = False
+
+    @property
+    def allow_horizontal_scroll(self) -> bool:
+        return False
+
+    class Clicked(Message):
+        def __init__(self, row: int) -> None:
+            super().__init__()
+            self.row = row
+
+    def on_click(self, event: events.Click) -> None:
+        region = self.content_region
+        self.post_message(self.Clicked(row=event.screen_y - region.y + int(self.scroll_y)))
+        event.stop()
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="sidebar-content", expand=True)
+
+    def set_content(self, text: Text, selected: int) -> None:
+        self.query_one("#sidebar-content", Static).update(text)
+        self.call_after_refresh(self._ensure_visible, selected)
+
+    def _ensure_visible(self, row: int) -> None:
+        height = self.size.height
+        cur = int(self.scroll_y)
+        if row < cur:
+            self.scroll_to(y=row, animate=False)
+        elif row >= cur + height:
+            self.scroll_to(y=row - height + 1, animate=False)
+
+
 class DiffPager(App):
     MOUSE_SUPPORT = False
     # Textual's command palette claims ctrl+p, which the comment box uses to prompt Claude
@@ -398,7 +534,16 @@ class DiffPager(App):
         padding: 0 1;
         text-align: right;
     }
+    Horizontal#main {
+        height: 1fr;
+    }
+    Sidebar {
+        width: 36;
+        height: 1fr;
+        border-right: solid $primary;
+    }
     DiffView {
+        width: 1fr;
         height: 1fr;
     }
     Input#jump {
@@ -458,8 +603,12 @@ class DiffPager(App):
     """
 
     BINDINGS = [
-        Binding("left", "prev_file", "Prev File"),
-        Binding("right", "next_file", "Next File"),
+        Binding("left", "left", "Prev File"),
+        Binding("right", "right", "Next File"),
+        Binding("n", "toggle_sidebar", "Nav", show=False),
+        Binding("N", "toggle_sidebar", "Nav", show=False),
+        Binding("b", "toggle_blame", "Blame", show=False),
+        Binding("B", "toggle_blame", "Blame", show=False),
         Binding("f", "full_file", "Full File"),
         Binding("l", "toggle_line_nums", "Line #s", show=False),
         Binding("h", "toggle_highlight", "Highlight", show=False),
@@ -517,12 +666,27 @@ class DiffPager(App):
         self._parsed_lines: list[DiffLine] = []
         self._header_len = 4
         self._run_claude = False
+        self._blame = False
+        self._blame_cache: dict[tuple[str | None, str], dict[int, tuple[str, str]]] = {}
+        self._blame_revs: tuple[str, str | None] | None = None
+        self._blame_w = 0       # width of the blame gutter in the last render (0 = off)
+        self._sidebar_visible = False
+        self._sidebar_mode = False   # keyboard focus is in the sidebar
+        prefs = load_prefs()
+        self._full_pref = prefs.get("full", False)
+        self._show_line_nums = prefs.get("line_nums", False)
+        self._split_view = prefs.get("split", False)
+        self._highlight = prefs.get("highlight", False) and self._full_pref
+        self._blame = prefs.get("blame", False)
+        self._sidebar_visible = prefs.get("sidebar", False)
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="title"):
             yield Label("", id="title-file")
             yield Label("", id="title-info")
-        yield DiffView()
+        with Horizontal(id="main"):
+            yield Sidebar()
+            yield DiffView()
         yield SummaryArea("", id="summary-input")
         yield Label("", id="comment-label")
         yield CommentArea("", id="comment-input")
@@ -533,7 +697,7 @@ class DiffPager(App):
             yield Button("[bold yellow]F[/bold yellow]orward to claude", id="btn-claude", classes="summary-btn")
         with Horizontal(id="footer"):
             yield Label("", id="footer-status")
-            yield Label("[bold yellow]R[/bold yellow]eload  [bold yellow]L[/bold yellow]ines  [bold yellow]S[/bold yellow]plit  [bold yellow]H[/bold yellow]ighlight  [bold yellow]F[/bold yellow]ull  [bold yellow]W[/bold yellow]rite  [bold yellow]C[/bold yellow]opy  [bold yellow]Q[/bold yellow]uit", id="footer-keys")
+            yield Label("[bold yellow]R[/bold yellow]eload  [bold yellow]L[/bold yellow]ines  [bold yellow]N[/bold yellow]av  [bold yellow]B[/bold yellow]lame  [bold yellow]S[/bold yellow]plit  [bold yellow]H[/bold yellow]ighlight  [bold yellow]F[/bold yellow]ull  [bold yellow]W[/bold yellow]rite  [bold yellow]C[/bold yellow]opy  [bold yellow]Q[/bold yellow]uit", id="footer-keys")
 
     def on_mount(self) -> None:
         self.query_one(DiffView).focus()
@@ -629,6 +793,68 @@ class DiffPager(App):
                 return c
         return None
 
+    # ── Blame gutter ───────────────────────────────────────────────────────
+
+    def _new_path(self, index: int) -> str:
+        """The file's path on the new side (differs from the listed name for renames)."""
+        filename, content = self.files[index]
+        header = ANSI_ESCAPE.sub("", content.splitlines()[0]) if content else ""
+        match = re.match(r"diff --git a/(.*?) b/(.*)", header)
+        return match.group(2) if match else filename
+
+    def _blame_data(self, rev: str | None, path: str) -> dict[int, tuple[str, str]]:
+        key = (rev, path)
+        if key not in self._blame_cache:
+            self._blame_cache[key] = get_blame(path, rev)
+        return self._blame_cache[key]
+
+    def _blame_labels(self) -> dict[int, Text] | None:
+        """Gutter text per parsed line index, or None when blame is off.
+
+        Context and added lines are blamed on the new side of the diff, removed lines on the
+        old side. Uncommitted lines, and files git can't blame (untracked ones), are blank.
+        """
+        if not self._blame:
+            return None
+        if self._blame_revs is None:
+            self._blame_revs = blame_revs(self.diff_args)
+        old_rev, new_rev = self._blame_revs
+        new_data: dict[int, tuple[str, str]] = {}
+        old_data: dict[int, tuple[str, str]] = {}
+        if self.files[self._index][0] not in self._untracked_files:
+            new_data = self._blame_data(new_rev, self._new_path(self._index))
+            old_data = self._blame_data(old_rev, self.files[self._index][0])
+        blank = Text(" " * BLAME_W)
+        labels: dict[int, Text] = {}
+        for i, dl in enumerate(self._parsed_lines):
+            if self._is_hidden(i):
+                continue
+            label = blank
+            entry = None
+            if dl.kind in ("context", "added"):
+                entry = new_data.get(dl.dst_num)
+            elif dl.kind == "removed":
+                entry = old_data.get(dl.src_num)
+            if entry and set(entry[0]) != {"0"}:     # uncommitted lines stay blank
+                sha, author = entry
+                label = Text()
+                label.append(sha[:7], style=Style(color=_BLAME_COLOURS[int(sha[:4], 16) % len(_BLAME_COLOURS)]))
+                label.append(" " + author[:9].ljust(9) + " ", style=Style(dim=True))
+            labels[i] = label
+        return labels
+
+    def action_toggle_blame(self) -> None:
+        if self._on_summary_page() or self._comment_mode or self._revise_mode:
+            return
+        diff_view = self.query_one(DiffView)
+        top_line = self._line_at_row(int(diff_view.scroll_y))
+        self._blame = not self._blame
+        save_prefs(blame=self._blame)
+        self._refresh_view()
+        diff_view.scroll_to(y=self._rows_for_line(top_line)[0], animate=False)
+        if self._review_mode:
+            diff_view.ensure_line_visible(*self._rows_for_line(self._review_line))
+
     def _render_lines(self) -> Text:
         if self._split_view:
             return self._render_split()
@@ -659,7 +885,11 @@ class DiffPager(App):
         Long lines wrap inside their column; the shorter side of each row-group is
         padded with blank, unnumbered rows so both columns stay aligned.
         """
-        total = self._split_width()
+        full_width = self._split_width()
+        blame = self._blame_labels()
+        blame_w = self._blame_w = BLAME_W if blame is not None else 0
+        blank_blame = Text(" " * blame_w)
+        total = full_width - blame_w
         comment_indices = self._comment_indices_for_file()
         show_comment_col = bool(comment_indices)
         dim = Style(dim=True)
@@ -703,7 +933,7 @@ class DiffPager(App):
         self._row_lines = []
         self._row_cells = []
         self._left_w = left_w
-        self._rendered_width = total
+        self._rendered_width = full_width
         row_no = 0
 
         def emit(left: list[Text], right: list[Text], idxs: list[int],
@@ -711,6 +941,14 @@ class DiffPager(App):
             nonlocal row_no
             n = max(len(left), len(right))
             for r in range(n):
+                if blame is not None:
+                    # One gutter per row: the new side's label, else the removed line's
+                    label = blank_blame
+                    for idx in (cells[1], cells[0]):
+                        if r == 0 and idx in blame and blame[idx].plain.strip():
+                            label = blame[idx]
+                            break
+                    result.append_text(label)
                 result.append_text(left[r] if r < len(left) else Text(" " * left_w))
                 result.append_text(divider)
                 result.append_text(right[r] if r < len(right) else Text(" " * right_w))
@@ -756,6 +994,7 @@ class DiffPager(App):
                         row.stylize(Style(reverse=True))
                     rows.append(row)
                 for row in rows:
+                    result.append_text(blank_blame)
                     result.append_text(row)
                     result.append("\n")
                     self._row_lines.append(i)
@@ -802,12 +1041,16 @@ class DiffPager(App):
         dim = Style(dim=True)
         dot_style = Style(color="green", bold=True)
         total = self._rendered_width = self._split_width()
+        blame = self._blame_labels()
+        self._blame_w = BLAME_W if blame is not None else 0
         self._line_rows = [(0, 0)] * len(self._parsed_lines)
         self._row_lines = []
         self._row_cells = []
 
-        def prefix(dl: DiffLine, dotted: bool, first: bool) -> Text:
+        def prefix(i: int, dl: DiffLine, dotted: bool, first: bool) -> Text:
             p = Text()
+            if blame is not None:
+                p.append_text(blame.get(i, Text(" " * BLAME_W)) if first else Text(" " * BLAME_W))
             if self._show_line_nums:
                 # Source and diff line number columns (blank on wrapped continuation rows)
                 src = str(dl.src_num) if dl.src_num is not None else ""
@@ -816,7 +1059,7 @@ class DiffPager(App):
             if show_comment_col:
                 p.append("● " if dotted and first else "  ",
                          style=dot_style if dotted and first else Style())
-            if self._show_line_nums or show_comment_col:
+            if self._show_line_nums or show_comment_col or blame is not None:
                 p.append("│ ", style=dim)
             return p
 
@@ -824,12 +1067,12 @@ class DiffPager(App):
             if self._is_hidden(i):
                 self._line_rows[i] = (len(self._row_lines), len(self._row_lines))
                 continue
-            first = prefix(dl, i in comment_indices, True)
+            first = prefix(i, dl, i in comment_indices, True)
             pieces = self._wrap_cell(self._line_text(i), max(total - first.cell_len, 1))
             selected = self._review_mode and i == self._review_line
             start = len(self._row_lines)
             for k, piece in enumerate(pieces):
-                row = first.copy() if k == 0 else prefix(dl, False, False)
+                row = first.copy() if k == 0 else prefix(i, dl, False, False)
                 row.append_text(piece)
                 # Reverse-video selection highlight across the whole line
                 if selected:
@@ -879,10 +1122,115 @@ class DiffPager(App):
             status.update("Editing summary... (Ctrl+S / Esc save · Ctrl+C discard)")
         elif self._comment_mode:
             status.update("Commenting... (Enter save · Shift+Enter newline · Ctrl+P prompt Claude · Ctrl+C discard)")
+        elif self._sidebar_mode:
+            status.update("Navigating files... (↑↓ change file · Enter/Tab/→ back to diff)")
         elif self._review_mode:
             status.update("Reviewing... (Enter comment · ←→ files · Esc exit)")
         else:
             status.update("")
+        self._update_sidebar()
+
+    # ── Sidebar ────────────────────────────────────────────────────────────
+
+    def _sidebar_entries(self) -> list[str]:
+        entries = [name for name, _ in self.files]
+        if self._comments or self._on_summary_page():
+            entries.append("Review Summary")
+        return entries
+
+    def _update_sidebar(self) -> None:
+        sidebar = self.query_one(Sidebar)
+        sidebar.display = self._sidebar_visible
+        if not self._sidebar_visible:
+            return
+        width = sidebar.scrollable_content_region.width or 33
+        commented = {c.file_index for c in self._comments}
+        entries = self._sidebar_entries()
+        text = Text(no_wrap=True)
+        for i, name in enumerate(entries):
+            current = i == self._index
+            summary = i == len(self.files)
+            row = Text(no_wrap=True)
+            row.append("● " if i in commented else "  ",
+                       style=Style(color="yellow", bold=True))
+            room = max(width - 2, 1)
+            label = name if len(name) <= room else "…" + name[-(room - 1):]
+            if summary:
+                row.append(label, style=Style(italic=True))
+            else:
+                cut = label.rfind("/") + 1
+                row.append(label[:cut], style=Style(dim=True))
+                row.append(label[cut:])
+            row.pad_right(max(0, width - row.cell_len))
+            if current:
+                row.stylize(Style(bold=True, reverse=self._sidebar_mode,
+                                  color=None if self._sidebar_mode else "cyan"))
+            text.append_text(row)
+            if i < len(entries) - 1:
+                text.append("\n")
+        sidebar.set_content(text, min(self._index, len(entries) - 1))
+
+    def _goto(self, index: int) -> None:
+        """Show file `index`, or the summary page for index == len(files)."""
+        if index == len(self.files):
+            self._index = index
+            self._show_summary_page()
+        else:
+            self._show_file(index)
+
+    def _set_sidebar_mode(self, on: bool) -> None:
+        self._sidebar_mode = on
+        self._update_title_style()
+        if self._review_mode:
+            self._refresh_view()
+
+    def action_toggle_sidebar(self) -> None:
+        if self._comment_mode or self._revise_mode:
+            return
+        self._sidebar_visible = not self._sidebar_visible
+        save_prefs(sidebar=self._sidebar_visible)
+        if not self._sidebar_visible:
+            self._sidebar_mode = False
+        self._update_title_style()
+        # The diff changed width, so it needs laying out again
+        self.call_after_refresh(self._check_render_width)
+
+    def action_left(self) -> None:
+        """Into the sidebar if it's open, otherwise the previous file."""
+        if self._comment_mode or self._revise_mode or self._sidebar_mode:
+            return
+        if self._sidebar_visible:
+            self._set_sidebar_mode(True)
+        elif self._on_summary_page():
+            self._goto(len(self.files) - 1)
+        elif self._index > 0:
+            self._goto(self._index - 1)
+
+    def action_right(self) -> None:
+        """Out of the sidebar if we're in it, otherwise the next file."""
+        if self._comment_mode or self._revise_mode:
+            return
+        if self._sidebar_mode:
+            self._set_sidebar_mode(False)
+        elif self._on_summary_page():
+            return
+        elif self._index < len(self.files) - 1:
+            self._goto(self._index + 1)
+        elif self._comments:
+            self._goto(len(self.files))     # past the last file: the summary
+
+    def _sidebar_move(self, delta: int) -> None:
+        last = len(self._sidebar_entries()) - 1
+        target = max(0, min(last, self._index + delta))
+        if target != self._index:
+            self._goto(target)
+
+    def on_sidebar_clicked(self, event: Sidebar.Clicked) -> None:
+        if self._comment_mode or self._revise_mode:
+            return
+        if 0 <= event.row < len(self._sidebar_entries()):
+            self._sidebar_mode = True
+            self._goto(event.row)
 
     def _build_summary_text(self) -> str:
         if self._summary_text_override is not None:
@@ -1154,6 +1502,10 @@ class DiffPager(App):
 
         # Escape outside comment mode
         if event.key == "escape":
+            if self._sidebar_mode:
+                self._set_sidebar_mode(False)
+                event.stop()
+                return
             if self._review_mode:
                 self._exit_review_mode()
                 event.stop()
@@ -1186,25 +1538,6 @@ class DiffPager(App):
             self.action_forward_to_claude()
 
     # ── Actions ────────────────────────────────────────────────────────────
-
-    def action_prev_file(self) -> None:
-        if self._comment_mode or self._revise_mode:
-            return
-        if self._on_summary_page():
-            self._show_file(len(self.files) - 1)
-        elif self._index > 0:
-            self._show_file(self._index - 1)
-
-    def action_next_file(self) -> None:
-        if self._comment_mode or self._revise_mode:
-            return
-        if self._on_summary_page():
-            return
-        if self._index < len(self.files) - 1:
-            self._show_file(self._index + 1)
-        elif self._index == len(self.files) - 1 and self._comments:
-            self._index = len(self.files)
-            self._show_summary_page()
 
     def _load_full_view(self) -> None:
         """Replace the current file's parsed lines with its full-context diff."""
@@ -1244,12 +1577,14 @@ class DiffPager(App):
             # Highlighting only makes sense with full context, so it goes off too
             self._full_pref = False
             self._highlight = False
+            save_prefs(full=False, highlight=False)
             self._show_file(self._index)
             return
         self._enable_full_view()
 
     def _enable_full_view(self) -> None:
         self._full_pref = True
+        save_prefs(full=True)
         self._load_full_view()
         self._update_file_info()
         self._refresh_view(scroll_home=True)
@@ -1293,6 +1628,7 @@ class DiffPager(App):
 
         self.files = files
         self._untracked_files = set(untracked)
+        self._blame_cache.clear()
 
         if on_summary:
             self._index = len(self.files)
@@ -1326,12 +1662,14 @@ class DiffPager(App):
 
     def action_toggle_line_nums(self) -> None:
         self._show_line_nums = not self._show_line_nums
+        save_prefs(line_nums=self._show_line_nums)
         self._refresh_view()
 
     def action_toggle_highlight(self) -> None:
         if self._on_summary_page() or self._comment_mode or self._revise_mode:
             return
         self._highlight = not self._highlight
+        save_prefs(highlight=self._highlight)
         if self._highlight and not self._full_pref:
             # Hunks alone give false colours (multi-line constructs start off-screen),
             # so highlighting needs full-file view
@@ -1346,6 +1684,7 @@ class DiffPager(App):
         # Keep the same line at the top of the viewport across the switch
         top_line = self._line_at_row(int(diff_view.scroll_y))
         self._split_view = not self._split_view
+        save_prefs(split=self._split_view)
         self._refresh_view()
         diff_view.scroll_to(y=self._rows_for_line(top_line)[0], animate=False)
         if self._review_mode:
@@ -1353,12 +1692,14 @@ class DiffPager(App):
 
     def on_diff_view_clicked(self, event: DiffView.Clicked) -> None:
         """Click a line to select it (entering review mode if needed)."""
+        if self._sidebar_mode:
+            self._set_sidebar_mode(False)
         if (self._comment_mode or self._revise_mode or self._on_summary_page()
                 or not self._parsed_lines or not 0 <= event.row < len(self._row_lines)):
             return
         if self._split_view and event.row < len(self._row_cells):
             left, right = self._row_cells[event.row]
-            idx = (left if event.col < self._left_w + 1 else right)
+            idx = (left if event.col - self._blame_w < self._left_w + 1 else right)
             if idx is None:     # blank half of an unbalanced pair: take the other side
                 idx = right if left is None else left
         else:
@@ -1402,6 +1743,9 @@ class DiffPager(App):
     def action_review_up(self) -> None:
         if self._comment_mode:
             return
+        if self._sidebar_mode:
+            self._sidebar_move(-1)
+            return
         if self._review_mode and self._parsed_lines:
             self._move_review(-1)
             self._refresh_view()
@@ -1410,6 +1754,9 @@ class DiffPager(App):
 
     def action_review_down(self) -> None:
         if self._comment_mode:
+            return
+        if self._sidebar_mode:
+            self._sidebar_move(1)
             return
         if self._review_mode and self._parsed_lines:
             self._move_review(1)
@@ -1463,6 +1810,9 @@ class DiffPager(App):
 
     def action_enter_comment(self) -> None:
         if self._comment_mode or self._revise_mode:
+            return
+        if self._sidebar_mode:
+            self._set_sidebar_mode(False)
             return
         if self._on_summary_page():
             self._enter_revise_mode()
@@ -1539,7 +1889,9 @@ def load_diff(diff_args: list[str]) -> tuple[str, list[tuple[str, str]], list[st
     untracked_paths = get_untracked_files(diff_args)
     untracked_diff = "".join(get_untracked_diff(path) for path in untracked_paths)
     combined_output = diff_output + untracked_diff
-    return combined_output, parse_diff(combined_output), untracked_paths
+    # Untracked files are appended to the diff, so sort to interleave them alphabetically
+    files = sorted(parse_diff(combined_output), key=lambda f: (f[0].lower(), f[0]))
+    return combined_output, files, untracked_paths
 
 
 def main() -> None:

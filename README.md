@@ -42,7 +42,12 @@ pathspec`, only untracked files matching it are included.
 
 | Key | Action |
 |-----|--------|
-| `←` / `→` | Previous / next file |
+| `N` | Show / hide the file sidebar (Nav) |
+| `B` | Toggle a blame gutter (commit and author of each line, removed lines are blamed on the old side; uncommitted lines and untracked files are blank) |
+| `←` / `→` | Previous / next file. While the nav sidebar is open, `←` moves into it instead |
+| Click the sidebar | Move into it and select that file |
+| `↑` / `↓` (in the sidebar) | Change file |
+| `Enter` / `Tab` / `→` / `Esc` (in the sidebar) | Return to the diff |
 | `↑` / `↓` / `PgUp` / `PgDn` / `Space` | Scroll |
 | `Ctrl+↑` / `Ctrl+↓` | Scroll one line |
 | `F` | Toggle full file view (expand all context) |
@@ -55,6 +60,8 @@ pathspec`, only untracked files matching it are included.
 | `W` | Save comments to `~/.git-review` (without quitting) |
 | `Q` / `Esc` | Quit |
 | `:` | Jump to file by number |
+
+Toggle states (`B`, `N`, `F`, `L`, `S`, `H`) are saved immediately to `~/.config/git-review/git-review.json` (or `$XDG_CONFIG_HOME/git-review/`) and restored on the next run.
 
 ## Leaving comments
 
