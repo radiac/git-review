@@ -4,27 +4,37 @@
 # dependencies = [
 #   "textual>=0.50.0",
 #   "pyperclip>=1.8",
+#   "pygments>=2.0",
 # ]
 # ///
 
-__version__ = "0.1.5"
+__version__ = "0.2.0"
 
 import os
 import re
+import shlex
+from bisect import bisect_left
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import pyperclip
+from rich.console import Console
+from pygments.lexers import get_lexer_for_filename
+from pygments.util import ClassNotFound
 from rich.style import Style
+from rich.syntax import Syntax
 from rich.text import Text
 from textual import events
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer
 from textual.message import Message
 from textual.widgets import Button, Input, Label, Static, TextArea
+
+
+_WRAP_CONSOLE = Console()
 
 
 def get_branch() -> str:
@@ -166,6 +176,72 @@ def parse_lines(content: str) -> list[DiffLine]:
     return result
 
 
+def highlight_lines(filename: str, lines: list[DiffLine]) -> dict[int, Text]:
+    """Syntax-highlight the code part of each context/added/removed line.
+
+    Diffs are lexed as two reconstructed streams per hunk, old (context + removed)
+    and new (context + added), so multi-line constructs like docstrings highlight
+    properly. Context lines take their highlighting from the new stream. Returns
+    {line index: Text of the line body, without its +/-/space marker}; empty if
+    there is no lexer for the file.
+    """
+    try:
+        # stripnl/ensurenl would add or drop blank lines and misalign us with the diff
+        lexer = get_lexer_for_filename(filename, stripnl=False, ensurenl=False)
+    except ClassNotFound:
+        return {}
+    syntax = Syntax("", lexer, theme="ansi_dark")
+    out: dict[int, Text] = {}
+
+    def run(indices: list[int], into: dict[int, Text]) -> None:
+        if not indices:
+            return
+        code = "\n".join(lines[i].plain[1:] for i in indices)
+        rendered = list(syntax.highlight(code).split("\n"))
+        # Belt and braces: always exactly one Text per input line
+        rendered = (rendered + [Text("")] * len(indices))[:len(indices)]
+        for i, text in zip(indices, rendered):
+            # Drop any background the theme sets so we don't fight the terminal's
+            text.spans[:] = [
+                type(sp)(sp.start, sp.end, Style(color=sp.style.color, bold=sp.style.bold,
+                                                 italic=sp.style.italic, underline=sp.style.underline))
+                if isinstance(sp.style, Style) else sp
+                for sp in text.spans
+            ]
+            into[i] = text
+
+    old: list[int] = []
+    new: list[int] = []
+    new_hl: dict[int, Text] = {}
+    old_hl: dict[int, Text] = {}
+
+    def flush() -> None:
+        run(new, new_hl)
+        run(old, old_hl)
+        for i in new:
+            out[i] = new_hl[i]
+        for i in old:
+            if lines[i].kind == "removed":
+                out[i] = old_hl[i]
+        old.clear()
+        new.clear()
+        new_hl.clear()
+        old_hl.clear()
+
+    for i, dl in enumerate(lines):
+        if dl.kind in ("diff_header", "file_header", "hunk"):
+            flush()
+        elif dl.kind == "context":
+            old.append(i)
+            new.append(i)
+        elif dl.kind == "removed":
+            old.append(i)
+        elif dl.kind == "added":
+            new.append(i)
+    flush()
+    return out
+
+
 class CommentArea(TextArea):
     """TextArea for comment input. Enter/ctrl+s/escape submit; shift+enter inserts newline."""
 
@@ -176,6 +252,7 @@ class CommentArea(TextArea):
         Binding("ctrl+s", "submit_comment", priority=True, show=False),
         Binding("escape", "submit_comment", priority=True, show=False),
         Binding("ctrl+c", "discard_comment", priority=True, show=False),
+        Binding("ctrl+p", "prompt_claude", priority=True, show=False),
     ]
 
     class Submit(Message):
@@ -183,6 +260,9 @@ class CommentArea(TextArea):
 
     class Discard(Message):
         pass
+
+    class Ask(Message):
+        """Send the text to Claude as a prompt instead of saving it as a comment."""
 
     def action_insert_newline(self) -> None:
         self.insert("\n")
@@ -192,6 +272,9 @@ class CommentArea(TextArea):
 
     def action_discard_comment(self) -> None:
         self.post_message(self.Discard())
+
+    def action_prompt_claude(self) -> None:
+        self.post_message(self.Ask())
 
 
 class SummaryArea(TextArea):
@@ -242,6 +325,30 @@ class DiffView(ScrollableContainer):
     def scroll_page_down(self, **kwargs) -> None:
         super().scroll_page_down(animate=False)
 
+    class Clicked(Message):
+        """A click (not a drag) at a content row/column of the diff."""
+
+        def __init__(self, row: int, col: int) -> None:
+            super().__init__()
+            self.row = row
+            self.col = col
+
+    _down_at: tuple[int, int] | None = None
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        self._down_at = (event.screen_x, event.screen_y)
+
+    def on_click(self, event: events.Click) -> None:
+        # Mouse-down and up in different places is a text selection, not a click;
+        # double/triple clicks select a word/line
+        if getattr(event, "chain", 1) != 1 or self._down_at != (event.screen_x, event.screen_y):
+            return
+        region = self.content_region
+        self.post_message(self.Clicked(
+            row=event.screen_y - region.y + int(self.scroll_y),
+            col=event.screen_x - region.x,
+        ))
+
     def compose(self) -> ComposeResult:
         yield Static("", id="diff-content", expand=True)
 
@@ -252,17 +359,22 @@ class DiffView(ScrollableContainer):
     def update_content(self, text: Text) -> None:
         self.query_one("#diff-content", Static).update(text)
 
-    def ensure_line_visible(self, line_index: int) -> None:
+    def ensure_line_visible(self, line_index: int, end: int | None = None) -> None:
+        """Scroll so rows [line_index, end) are visible (end defaults to one row)."""
+        if end is None:
+            end = line_index + 1
         height = self.size.height
         cur = int(self.scroll_y)
         if line_index < cur:
             self.scroll_to(y=line_index, animate=False)
-        elif line_index >= cur + height:
-            self.scroll_to(y=line_index - height + 1, animate=False)
+        elif end > cur + height:
+            self.scroll_to(y=min(line_index, end - height), animate=False)
 
 
 class DiffPager(App):
     MOUSE_SUPPORT = False
+    # Textual's command palette claims ctrl+p, which the comment box uses to prompt Claude
+    ENABLE_COMMAND_PALETTE = False
     CSS = """
     Horizontal#title {
         height: 1;
@@ -350,8 +462,12 @@ class DiffPager(App):
         Binding("right", "next_file", "Next File"),
         Binding("f", "full_file", "Full File"),
         Binding("l", "toggle_line_nums", "Line #s", show=False),
-        Binding("r", "toggle_review", "Review", show=False),
-        Binding("R", "toggle_review", "Review", show=False),
+        Binding("h", "toggle_highlight", "Highlight", show=False),
+        Binding("H", "toggle_highlight", "Highlight", show=False),
+        Binding("s", "toggle_split", "Split", show=False),
+        Binding("S", "toggle_split", "Split", show=False),
+        Binding("r", "reload", "Reload", show=False),
+        Binding("R", "reload", "Reload", show=False),
         Binding("up", "review_up", "Up", priority=True, show=False),
         Binding("down", "review_down", "Down", priority=True, show=False),
         Binding("ctrl+up", "viewport_up", "Scroll Up", priority=True, show=False),
@@ -361,6 +477,7 @@ class DiffPager(App):
         Binding("tab", "enter_comment", "Comment", priority=True, show=False),
         Binding("enter", "enter_comment", "Comment", show=False),
         Binding("c", "copy_review", "Copy", show=False),
+        Binding("C", "copy_review", "Copy", show=False),
         Binding("colon", "jump", "Jump to file", show=False),
         Binding("q", "quit", "Quit"),
     ]
@@ -379,12 +496,23 @@ class DiffPager(App):
         self._untracked_files = untracked_files or set()
         self._index = 0
         self._full_view = False
+        self._full_pref = False   # sticky: stay in full view when changing file
         self._review_mode = False
         self._review_line = 0
         self._comment_mode = False
         self._revise_mode = False
         self._summary_text_override: str | None = None
         self._show_line_nums = False
+        self._split_view = False
+        self._highlight = False
+        self._hl_cache: tuple[list[DiffLine], dict[int, Text]] | None = None
+        # Split view only: per parsed line, its (first_row, end_row) in the rendered
+        # output, and per rendered row, the parsed line index it belongs to.
+        self._line_rows: list[tuple[int, int]] = []
+        self._row_lines: list[int] = []
+        self._row_cells: list[tuple[int | None, int | None]] = []   # split: (left, right) line per row
+        self._left_w = 0
+        self._rendered_width = 0
         self._comments: list[Comment] = []
         self._parsed_lines: list[DiffLine] = []
         self._header_len = 4
@@ -405,7 +533,7 @@ class DiffPager(App):
             yield Button("[bold yellow]F[/bold yellow]orward to claude", id="btn-claude", classes="summary-btn")
         with Horizontal(id="footer"):
             yield Label("", id="footer-status")
-            yield Label("[bold yellow]R[/bold yellow]eview  [bold yellow]L[/bold yellow]ines  [bold yellow]F[/bold yellow]ull  [bold yellow]W[/bold yellow]rite  [bold yellow]Q[/bold yellow]uit", id="footer-keys")
+            yield Label("[bold yellow]R[/bold yellow]eload  [bold yellow]L[/bold yellow]ines  [bold yellow]S[/bold yellow]plit  [bold yellow]H[/bold yellow]ighlight  [bold yellow]F[/bold yellow]ull  [bold yellow]W[/bold yellow]rite  [bold yellow]C[/bold yellow]opy  [bold yellow]Q[/bold yellow]uit", id="footer-keys")
 
     def on_mount(self) -> None:
         self.query_one(DiffView).focus()
@@ -414,12 +542,26 @@ class DiffPager(App):
     # ── Helpers ────────────────────────────────────────────────────────────
 
     def _find_line_by_num(self, src_num: int | None, dst_num: int | None) -> int:
-        """Find the index in current _parsed_lines matching src_num or dst_num. Returns -1 if absent."""
-        for i, dl in enumerate(self._parsed_lines):
-            if src_num is not None and dl.src_num == src_num:
-                return i
-            if dst_num is not None and dl.dst_num == dst_num:
-                return i
+        """Find the index in current _parsed_lines for a line identified by its numbers.
+
+        Tries an exact (src, dst) match first. Failing that, the source number alone
+        (A-side numbers are stable when only the working tree changes, whereas B-side
+        numbers shift as lines are added above), then the destination number alone.
+        Returns -1 if absent.
+        """
+        lines = self._parsed_lines
+        if src_num is not None and dst_num is not None:
+            for i, dl in enumerate(lines):
+                if dl.src_num == src_num and dl.dst_num == dst_num:
+                    return i
+        if src_num is not None:
+            for i, dl in enumerate(lines):
+                if dl.src_num == src_num:
+                    return i
+        if dst_num is not None:
+            for i, dl in enumerate(lines):
+                if dl.dst_num == dst_num:
+                    return i
         return -1
 
     def _resolve_line_index(self, c: Comment) -> int:
@@ -433,10 +575,42 @@ class DiffPager(App):
                 c.diff_line_index = self._find_line_by_num(c.src_num, c.dst_num)
             return c.diff_line_index
 
+    def _is_hidden(self, i: int) -> bool:
+        """Lines we never draw: the diff header, plus the lone @@ in full view.
+
+        Files with no hunks at all (pure renames, binary changes) have nothing but
+        header, so it stays visible rather than leaving a blank screen.
+        """
+        if self._header_len >= len(self._parsed_lines):
+            return False
+        if i < self._header_len:
+            return True
+        return self._full_view and self._parsed_lines[i].kind == "hunk"
+
+    def _nav_positions(self) -> list[int]:
+        """Review-cursor stops in order: -1 is the filename in the title bar (a
+        whole-file comment), then every visible diff line."""
+        return [-1] + [i for i in range(len(self._parsed_lines)) if not self._is_hidden(i)]
+
+    def _move_review(self, delta: int) -> None:
+        stops = self._nav_positions()
+        k = min(bisect_left(stops, self._review_line), len(stops) - 1)
+        self._review_line = stops[max(0, min(len(stops) - 1, k + delta))]
+
+    def _update_title_file(self) -> None:
+        if self._on_summary_page():
+            return
+        t = Text()
+        if self._get_comment_for_line(-1):
+            t.append("● ", style=Style(color="yellow", bold=True))
+        selected = self._review_mode and self._review_line == -1
+        t.append(self.files[self._index][0], style=Style(bold=True, reverse=selected))
+        self.query_one("#title-file", Label).update(t)
+
     def _comment_indices_for_file(self) -> set[int]:
         indices = set()
         for c in self._comments:
-            if c.file_index != self._index:
+            if c.file_index != self._index or c.file_level:
                 continue
             idx = self._resolve_line_index(c)
             if idx >= 0:
@@ -444,54 +618,237 @@ class DiffPager(App):
         return indices
 
     def _get_comment_for_line(self, line_idx: int) -> Comment | None:
+        """Comment on a diff line, or the whole-file comment when line_idx is -1."""
         for c in self._comments:
-            if c.file_index == self._index and self._resolve_line_index(c) == line_idx:
+            if c.file_index != self._index:
+                continue
+            if line_idx == -1:
+                if c.file_level:
+                    return c
+            elif not c.file_level and self._resolve_line_index(c) == line_idx:
                 return c
         return None
 
     def _render_lines(self) -> Text:
+        if self._split_view:
+            return self._render_split()
+        return self._render_unified()
+
+    # ── Split rendering ────────────────────────────────────────────────────
+
+    def _split_width(self) -> int:
+        view = self.query_one(DiffView)
+        width = view.scrollable_content_region.width or view.size.width or self.size.width
+        return max(width, 20)
+
+    @staticmethod
+    def _wrap_cell(text: Text, width: int) -> list[Text]:
+        """Wrap to `width` cells, each row padded to exactly `width`."""
+        width = max(width, 1)
+        rows = text.wrap(_WRAP_CONSOLE, width, overflow="fold") if text.cell_len else [Text("")]
+        out = []
+        for row in rows or [Text("")]:
+            row = row.copy()
+            row.pad_right(max(0, width - row.cell_len))
+            out.append(row)
+        return out
+
+    def _render_split(self) -> Text:
+        """A on the left (context + removed), B on the right (context + added).
+
+        Long lines wrap inside their column; the shorter side of each row-group is
+        padded with blank, unnumbered rows so both columns stay aligned.
+        """
+        total = self._split_width()
+        comment_indices = self._comment_indices_for_file()
+        show_comment_col = bool(comment_indices)
+        dim = Style(dim=True)
+        dot_style = Style(color="green", bold=True)
+        divider = Text(" │ ", style=dim)
+
+        num_w = 5 if self._show_line_nums else 0       # "NNNN "
+        dot_w = 2 if show_comment_col else 0           # "● "
+        gutter_w = num_w + dot_w
+        left_w = (total - divider.cell_len) // 2
+        right_w = total - divider.cell_len - left_w    # takes the odd column
+        full_body_w = max(total - gutter_w, 1)
+        parsed = self._parsed_lines
+
+        def gutter(num: int | None, dotted: bool) -> Text:
+            g = Text()
+            if num_w:
+                g.append(f"{num:>4} " if num is not None else " " * num_w, style=dim)
+            if dot_w:
+                g.append("● " if dotted else "  ", style=dot_style if dotted else Style())
+            return g
+
+        def cell(idx: int | None, num_attr: str, col_w: int) -> list[Text]:
+            """Rows for one side of a group: gutter + wrapped content, col_w wide."""
+            if idx is None:
+                return [Text(" " * col_w)]
+            dl = parsed[idx]
+            body = self._wrap_cell(self._line_text(idx), max(col_w - gutter_w, 1))
+            rows = []
+            for n, piece in enumerate(body):
+                row = gutter(getattr(dl, num_attr) if n == 0 else None,
+                             n == 0 and idx in comment_indices)
+                row.append_text(piece)
+                if idx == self._review_line and self._review_mode:
+                    row.stylize(Style(reverse=True))
+                rows.append(row)
+            return rows
+
+        result = Text()
+        self._line_rows = [(0, 0)] * len(parsed)
+        self._row_lines = []
+        self._row_cells = []
+        self._left_w = left_w
+        self._rendered_width = total
+        row_no = 0
+
+        def emit(left: list[Text], right: list[Text], idxs: list[int],
+                 cells: tuple[int | None, int | None]) -> None:
+            nonlocal row_no
+            n = max(len(left), len(right))
+            for r in range(n):
+                result.append_text(left[r] if r < len(left) else Text(" " * left_w))
+                result.append_text(divider)
+                result.append_text(right[r] if r < len(right) else Text(" " * right_w))
+                result.append("\n")
+                self._row_lines.append(idxs[0])
+                self._row_cells.append(cells)
+            for i in idxs:
+                self._line_rows[i] = (row_no, row_no + n)
+            row_no += n
+
+        i = 0
+        while i < len(parsed):
+            dl = parsed[i]
+            if self._is_hidden(i):
+                self._line_rows[i] = (row_no, row_no)
+                i += 1
+                continue
+            if dl.kind == "context":
+                emit(cell(i, "src_num", left_w), cell(i, "dst_num", right_w), [i], (i, i))
+                i += 1
+            elif dl.kind in ("removed", "added"):
+                removed: list[int] = []
+                added: list[int] = []
+                while i < len(parsed) and parsed[i].kind == "removed":
+                    removed.append(i)
+                    i += 1
+                while i < len(parsed) and parsed[i].kind == "added":
+                    added.append(i)
+                    i += 1
+                for k in range(max(len(removed), len(added))):
+                    li = removed[k] if k < len(removed) else None
+                    ri = added[k] if k < len(added) else None
+                    idxs = [x for x in (li, ri) if x is not None]
+                    emit(cell(li, "src_num", left_w), cell(ri, "dst_num", right_w), idxs, (li, ri))
+            else:
+                # Headers, hunk markers and anything else span both columns
+                body = self._wrap_cell(self._line_text(i), full_body_w)
+                rows = []
+                for n, piece in enumerate(body):
+                    row = gutter(None, n == 0 and i in comment_indices)
+                    row.append_text(piece)
+                    if i == self._review_line and self._review_mode:
+                        row.stylize(Style(reverse=True))
+                    rows.append(row)
+                for row in rows:
+                    result.append_text(row)
+                    result.append("\n")
+                    self._row_lines.append(i)
+                    self._row_cells.append((i, i))
+                self._line_rows[i] = (row_no, row_no + len(rows))
+                row_no += len(rows)
+                i += 1
+        return result
+
+    def _line_text(self, i: int) -> Text:
+        """The styled text for a parsed line: git's colours, or syntax-highlighted."""
+        dl = self._parsed_lines[i]
+        if self._highlight and self._full_view and dl.kind in ("context", "added", "removed"):
+            cache = self._hl_cache
+            if cache is None or cache[0] is not self._parsed_lines:
+                cache = (self._parsed_lines,
+                         highlight_lines(self.files[self._index][0], self._parsed_lines))
+                self._hl_cache = cache
+            body = cache[1].get(i)
+            if body is not None:
+                marker_style = {"added": "bold green", "removed": "bold red"}.get(dl.kind, "")
+                return Text(dl.plain[0], style=marker_style) + body
+        return Text.from_ansi(dl.text)
+
+    def _rows_for_line(self, line_idx: int) -> tuple[int, int]:
+        if line_idx == -1:          # the filename in the title bar: top of the view
+            return (0, 1)
+        if 0 <= line_idx < len(self._line_rows):
+            return self._line_rows[line_idx]
+        return (line_idx, line_idx + 1)
+
+    def _line_at_row(self, row: int) -> int:
+        if self._row_lines:
+            return self._row_lines[max(0, min(row, len(self._row_lines) - 1))]
+        return row
+
+    def _render_unified(self) -> Text:
+        """One column, with long lines wrapped here (not by Textual) so we know which
+        screen row belongs to which line."""
         result = Text()
         comment_indices = self._comment_indices_for_file()
         # Show comment column whenever this file has any comments
         show_comment_col = bool(comment_indices)
         dim = Style(dim=True)
         dot_style = Style(color="green", bold=True)
+        total = self._rendered_width = self._split_width()
+        self._line_rows = [(0, 0)] * len(self._parsed_lines)
+        self._row_lines = []
+        self._row_cells = []
 
-        for i, dl in enumerate(self._parsed_lines):
-            has_comment = i in comment_indices
-            is_selected = self._review_mode and i == self._review_line
-
-            # Track start of line for selection highlight spanning the whole line
-            line_start = len(result)
-
-            # Build left-margin prefix
+        def prefix(dl: DiffLine, dotted: bool, first: bool) -> Text:
+            p = Text()
             if self._show_line_nums:
-                # Source and diff line number columns
+                # Source and diff line number columns (blank on wrapped continuation rows)
                 src = str(dl.src_num) if dl.src_num is not None else ""
                 dst = str(dl.dst_num) if dl.dst_num is not None else ""
-                result.append(f"{src:>4} {dst:>4} ", style=dim)
-                # Comment dot sits between numbers and the single bar
-                if show_comment_col:
-                    result.append("● " if has_comment else "  ",
-                                  style=dot_style if has_comment else Style())
-                result.append("│ ", style=dim)
-            elif show_comment_col:
-                # No line numbers — bar with dot provides the margin
-                result.append("● " if has_comment else "  ",
-                               style=dot_style if has_comment else Style())
-                result.append("│ ", style=dim)
+                p.append(f"{src:>4} {dst:>4} " if first else " " * 10, style=dim)
+            if show_comment_col:
+                p.append("● " if dotted and first else "  ",
+                         style=dot_style if dotted and first else Style())
+            if self._show_line_nums or show_comment_col:
+                p.append("│ ", style=dim)
+            return p
 
-            # Diff line content (preserving ANSI colours)
-            result.append_text(Text.from_ansi(dl.text))
-            result.append("\n")
-
-            # Apply reverse-video selection highlight across the whole line
-            if is_selected:
-                result.stylize(Style(reverse=True), line_start, len(result))
+        for i, dl in enumerate(self._parsed_lines):
+            if self._is_hidden(i):
+                self._line_rows[i] = (len(self._row_lines), len(self._row_lines))
+                continue
+            first = prefix(dl, i in comment_indices, True)
+            pieces = self._wrap_cell(self._line_text(i), max(total - first.cell_len, 1))
+            selected = self._review_mode and i == self._review_line
+            start = len(self._row_lines)
+            for k, piece in enumerate(pieces):
+                row = first.copy() if k == 0 else prefix(dl, False, False)
+                row.append_text(piece)
+                # Reverse-video selection highlight across the whole line
+                if selected:
+                    row.stylize(Style(reverse=True))
+                result.append_text(row)
+                result.append("\n")
+            self._line_rows[i] = (start, start + len(pieces))
+            self._row_lines.extend([i] * len(pieces))
 
         return result
 
-    def _refresh_view(self, scroll_home: bool = False) -> None:
+    def _check_render_width(self) -> None:
+        """A scrollbar appearing after we laid out narrows the view; redo once at the true width."""
+        if self._on_summary_page() or self._revise_mode or not self._parsed_lines:
+            return
+        if self._split_width() != self._rendered_width:
+            self._refresh_view(_retry=True)
+
+    def _refresh_view(self, scroll_home: bool = False, _retry: bool = False) -> None:
         diff_view = self.query_one(DiffView)
         text = self._render_lines()
         if scroll_home:
@@ -499,7 +856,10 @@ class DiffPager(App):
         else:
             diff_view.update_content(text)
             if self._review_mode:
-                diff_view.ensure_line_visible(self._review_line)
+                diff_view.ensure_line_visible(*self._rows_for_line(self._review_line))
+        self._update_title_file()
+        if not _retry:
+            self.call_after_refresh(self._check_render_width)
 
     def _update_title_style(self) -> None:
         title = self.query_one("#title", Horizontal)
@@ -511,13 +871,16 @@ class DiffPager(App):
         elif self._review_mode:
             title.add_class("review")
 
+        # The shortcut hints (Reload, Split, ...) don't work while typing in a text box
+        self.query_one("#footer-keys", Label).display = not (self._comment_mode or self._revise_mode)
+
         status = self.query_one("#footer-status", Label)
         if self._revise_mode:
             status.update("Editing summary... (Ctrl+S / Esc save · Ctrl+C discard)")
         elif self._comment_mode:
-            status.update("Commenting... (Enter save · Shift+Enter newline · Ctrl+C discard)")
+            status.update("Commenting... (Enter save · Shift+Enter newline · Ctrl+P prompt Claude · Ctrl+C discard)")
         elif self._review_mode:
-            status.update("Reviewing... (Enter comment · ←→ files · r/Esc exit)")
+            status.update("Reviewing... (Enter comment · ←→ files · Esc exit)")
         else:
             status.update("")
 
@@ -555,8 +918,9 @@ class DiffPager(App):
         filename, content = self.files[index]
         self._parsed_lines = parse_lines(content)
         self._header_len = compute_header_len(self._parsed_lines)
+        if self._full_pref:
+            self._load_full_view()
         n = len(self.files)
-        self.query_one("#title-file", Label).update(f"[bold]{filename}[/bold]")
         self._update_file_info()
         self._update_title_style()
         self.query_one("#summary-actions", Horizontal).display = False
@@ -590,10 +954,10 @@ class DiffPager(App):
         self._comment_mode = True
         self._update_title_style()
 
-        dl = self._parsed_lines[self._review_line] if self._parsed_lines else None
+        dl = self._parsed_lines[self._review_line] if self._parsed_lines and self._review_line >= 0 else None
         filename = self.files[self._index][0]
         label = self.query_one("#comment-label", Label)
-        if self._review_line < self._header_len:
+        if self._review_line < 0:
             label.update(f"Comment for {filename} (whole file)")
         else:
             line_ref = (dl.src_num or dl.dst_num or self._review_line) if dl else self._review_line
@@ -614,10 +978,10 @@ class DiffPager(App):
             if existing:
                 self._comments.remove(existing)
             if text:
-                dl = self._parsed_lines[self._review_line] if self._parsed_lines else None
+                dl = self._parsed_lines[self._review_line] if self._parsed_lines and self._review_line >= 0 else None
                 lines = self._parsed_lines
                 idx = self._review_line
-                file_level = idx < self._header_len
+                file_level = idx < 0    # the filename in the title bar
                 if file_level:
                     before, after = [], []
                     src_num = dst_num = None
@@ -629,8 +993,8 @@ class DiffPager(App):
                 self._comments.append(Comment(
                     file_index=self._index,
                     filename=self.files[self._index][0],
-                    diff_line_index=idx if not self._full_view else None,
-                    full_line_index=idx if self._full_view else None,
+                    diff_line_index=None if file_level or self._full_view else idx,
+                    full_line_index=None if file_level or not self._full_view else idx,
                     src_num=src_num,
                     dst_num=dst_num,
                     context_before=before,
@@ -673,6 +1037,70 @@ class DiffPager(App):
     def on_comment_area_discard(self, event: CommentArea.Discard) -> None:
         if self._comment_mode:
             self._exit_comment_mode(save=False)
+
+    def on_comment_area_ask(self, event: CommentArea.Ask) -> None:
+        if not self._comment_mode:
+            return
+        question = self.query_one("#comment-input", CommentArea).text.strip()
+        if not question:
+            self.query_one("#footer-status", Label).update("Type a prompt first, then Ctrl+P")
+            return
+        prompt = self._build_ask_prompt(question)
+        self._exit_comment_mode(save=False)   # a prompt isn't saved as a comment
+        self._run_claude_session(prompt)
+
+    def _build_ask_prompt(self, question: str) -> str:
+        """A prompt for Claude: the request, plus the file and line it's about."""
+        filename = self.files[self._index][0]
+        cmd = shlex.join(["git", "diff", *self.diff_args])
+        parts = [
+            "I'm reviewing a diff in git-review and have a request about a specific spot in it.",
+            "Do not use the git-review skill: that loads a saved review from disk, and this "
+            "request is not one. Everything you need is in this message.",
+            "",
+            f"Diff being reviewed: `{cmd}` (\"old\" is the side it compares from, \"new\" the side "
+            "it compares to; untracked files are included as entirely new).",
+            f"File: {filename}" + (" (untracked, so entirely new)" if filename in self._untracked_files else ""),
+        ]
+        idx = self._review_line
+        if idx < 0 or idx >= len(self._parsed_lines):
+            parts.append("Scope: the whole file.")
+        else:
+            dl = self._parsed_lines[idx]
+            if dl.src_num is not None and dl.dst_num is not None:
+                where = f"line {dl.dst_num} in the new version (line {dl.src_num} in the old version)"
+            elif dl.dst_num is not None:
+                where = f"line {dl.dst_num} in the new version (an added line)"
+            elif dl.src_num is not None:
+                where = f"line {dl.src_num} in the old version (a removed line)"
+            else:
+                where = "this part of the diff"
+            parts.append(f"Location: {where}")
+            parts.append("")
+            parts.append("Diff around it (the line marked > is the one I mean):")
+            parts.append("```diff")
+            for j in range(max(0, idx - 3), min(len(self._parsed_lines), idx + 4)):
+                if not self._is_hidden(j):
+                    parts.append(f"{'>' if j == idx else ' '} {self._parsed_lines[j].plain}")
+            parts.append("```")
+        parts += ["", "My request:", question]
+        return "\n".join(parts)
+
+    def _run_claude_session(self, prompt: str) -> None:
+        """Hand the terminal to an interactive claude session, then reload the diff."""
+        claude = os.environ.get("CLAUDE", "claude")
+        status = self.query_one("#footer-status", Label)
+        try:
+            with self.suspend():
+                subprocess.run([claude, prompt])
+        except SuspendNotSupported:
+            status.update("This terminal can't suspend git-review to run Claude")
+            return
+        except FileNotFoundError:
+            status.update(f"Couldn't run '{claude}' (set $CLAUDE to its path)")
+            return
+        # Claude may have edited files, so pick up whatever changed
+        self.action_reload()
 
     def on_summary_area_submit(self, event: SummaryArea.Submit) -> None:
         if self._revise_mode:
@@ -778,18 +1206,13 @@ class DiffPager(App):
             self._index = len(self.files)
             self._show_summary_page()
 
-    def action_full_file(self) -> None:
-        if self._on_summary_page():
-            return
-        if self._full_view:
-            self._show_file(self._index)
-            return
+    def _load_full_view(self) -> None:
+        """Replace the current file's parsed lines with its full-context diff."""
         filename, content = self.files[self._index]
         if filename in self._untracked_files:
             # Untracked files are diffed against /dev/null, so the diff view already
             # contains the whole file — there's no extra context to expand.
             self._full_view = True
-            self._update_file_info()
             return
         base_args = []
         for arg in self.diff_args:
@@ -808,21 +1231,156 @@ class DiffPager(App):
             ["git", "diff", "--color=always", "-U99999", *base_args, "--", *pathspecs],
             capture_output=True, text=True,
         )
-        content = result.stdout
+        if not result.stdout:
+            return  # nothing to expand; stay on the normal diff for this file
         self._full_view = True
-        self._parsed_lines = parse_lines(content)
+        self._parsed_lines = parse_lines(result.stdout)
         self._header_len = compute_header_len(self._parsed_lines)
+
+    def action_full_file(self) -> None:
+        if self._on_summary_page():
+            return
+        if self._full_pref or self._full_view:
+            # Highlighting only makes sense with full context, so it goes off too
+            self._full_pref = False
+            self._highlight = False
+            self._show_file(self._index)
+            return
+        self._enable_full_view()
+
+    def _enable_full_view(self) -> None:
+        self._full_pref = True
+        self._load_full_view()
         self._update_file_info()
         self._refresh_view(scroll_home=True)
+
+    def action_reload(self) -> None:
+        """Re-run the diff and return to the same file and line."""
+        if self._comment_mode or self._revise_mode:
+            return
+        status = self.query_one("#footer-status", Label)
+        _, files, untracked = load_diff(self.diff_args)
+        if not files:
+            status.update("No diff after reload — keeping previous view")
+            return
+
+        # Remember where we were, by file name and line number rather than index
+        on_summary = self._on_summary_page()
+        old_index = self._index
+        was_review = self._review_mode
+        was_title = was_review and self._review_line == -1
+        anchor_name = anchor_nums = None
+        scroll = offset = 0
+        if not on_summary:
+            view = self.query_one(DiffView)
+            anchor_name = self.files[self._index][0]
+            scroll = int(view.scroll_y)
+            anchor = self._review_line if was_review else self._line_at_row(scroll)
+            if 0 <= anchor < len(self._parsed_lines):
+                dl = self._parsed_lines[anchor]
+                anchor_nums = (dl.src_num, dl.dst_num)
+                offset = max(0, self._rows_for_line(anchor)[0] - scroll)
+
+        # Comments follow their file by name. Their line numbers are re-resolved against
+        # the new diff; if the code moved under them, the frozen context in the summary
+        # is what Claude has to go on.
+        new_index = {name: i for i, (name, _) in enumerate(files)}
+        for c in self._comments:
+            c.file_index = new_index.get(c.filename, -1)
+            if c.src_num is not None or c.dst_num is not None:
+                c.diff_line_index = None
+                c.full_line_index = None
+
+        self.files = files
+        self._untracked_files = set(untracked)
+
+        if on_summary:
+            self._index = len(self.files)
+            self._show_summary_page()
+            status.update("Reloaded")
+            return
+
+        idx = new_index.get(anchor_name)
+        gone = idx is None
+        self._show_file(min(old_index, len(files) - 1) if gone else idx)
+
+        pos = -1
+        if anchor_nums and anchor_nums != (None, None):
+            pos = self._find_line_by_num(*anchor_nums)
+        if was_review and not gone:
+            self._review_line = -1 if was_title else (pos if pos >= 0 else self._line_at_row(scroll))
+            self._review_mode = True
+            self._update_title_style()
+            self._refresh_view()
+
+        def restore() -> None:
+            view = self.query_one(DiffView)
+            if gone:
+                return
+            row = self._rows_for_line(pos)[0] - offset if pos >= 0 else scroll
+            view.scroll_to(y=max(0, row), animate=False)
+
+        # Scrolling has to wait for the new content to be laid out
+        self.call_after_refresh(restore)
+        status.update(f"{anchor_name} is no longer in the diff" if gone else "Reloaded")
 
     def action_toggle_line_nums(self) -> None:
         self._show_line_nums = not self._show_line_nums
         self._refresh_view()
 
+    def action_toggle_highlight(self) -> None:
+        if self._on_summary_page() or self._comment_mode or self._revise_mode:
+            return
+        self._highlight = not self._highlight
+        if self._highlight and not self._full_pref:
+            # Hunks alone give false colours (multi-line constructs start off-screen),
+            # so highlighting needs full-file view
+            self._enable_full_view()
+        else:
+            self._refresh_view()
+
+    def action_toggle_split(self) -> None:
+        if self._on_summary_page() or self._comment_mode or self._revise_mode:
+            return
+        diff_view = self.query_one(DiffView)
+        # Keep the same line at the top of the viewport across the switch
+        top_line = self._line_at_row(int(diff_view.scroll_y))
+        self._split_view = not self._split_view
+        self._refresh_view()
+        diff_view.scroll_to(y=self._rows_for_line(top_line)[0], animate=False)
+        if self._review_mode:
+            diff_view.ensure_line_visible(*self._rows_for_line(self._review_line))
+
+    def on_diff_view_clicked(self, event: DiffView.Clicked) -> None:
+        """Click a line to select it (entering review mode if needed)."""
+        if (self._comment_mode or self._revise_mode or self._on_summary_page()
+                or not self._parsed_lines or not 0 <= event.row < len(self._row_lines)):
+            return
+        if self._split_view and event.row < len(self._row_cells):
+            left, right = self._row_cells[event.row]
+            idx = (left if event.col < self._left_w + 1 else right)
+            if idx is None:     # blank half of an unbalanced pair: take the other side
+                idx = right if left is None else left
+        else:
+            idx = self._row_lines[event.row]
+        if idx is None:
+            return
+        self._review_line = idx
+        self._review_mode = True
+        self._update_title_style()
+        self._refresh_view()
+
+    def on_resize(self, event: events.Resize) -> None:
+        # Split columns are sized to the terminal width, so redraw on resize
+        if self._split_view and self._parsed_lines:
+            self.call_after_refresh(self._redraw_split)
+
+    def _redraw_split(self) -> None:
+        if self._split_view and not self._on_summary_page() and not self._revise_mode:
+            self._refresh_view()
+
     def action_toggle_review(self) -> None:
         if self._on_summary_page():
-            if not self._revise_mode:
-                self._enter_revise_mode()
             return
         if self._comment_mode:
             self._exit_comment_mode(save=False)
@@ -832,8 +1390,11 @@ class DiffPager(App):
             self._exit_review_mode()
             return
         # Start at the first currently-visible line
-        first_visible = int(self.query_one(DiffView).scroll_y)
-        self._review_line = max(0, min(first_visible, len(self._parsed_lines) - 1)) if self._parsed_lines else 0
+        stops = self._nav_positions()
+        first_visible = self._line_at_row(int(self.query_one(DiffView).scroll_y))
+        if first_visible not in stops:
+            first_visible = stops[1] if len(stops) > 1 else -1
+        self._review_line = first_visible
         self._review_mode = True
         self._update_title_style()
         self._refresh_view()
@@ -842,7 +1403,7 @@ class DiffPager(App):
         if self._comment_mode:
             return
         if self._review_mode and self._parsed_lines:
-            self._review_line = max(0, self._review_line - 1)
+            self._move_review(-1)
             self._refresh_view()
         else:
             self.query_one(DiffView).scroll_up()
@@ -851,7 +1412,7 @@ class DiffPager(App):
         if self._comment_mode:
             return
         if self._review_mode and self._parsed_lines:
-            self._review_line = min(len(self._parsed_lines) - 1, self._review_line + 1)
+            self._move_review(1)
             self._refresh_view()
         else:
             self.query_one(DiffView).scroll_down()
@@ -861,7 +1422,7 @@ class DiffPager(App):
             return
         if self._review_mode and self._parsed_lines:
             height = self.query_one(DiffView).size.height
-            self._review_line = max(0, self._review_line - height)
+            self._move_review(-height)
             self._refresh_view()
         else:
             self.query_one(DiffView).scroll_page_up()
@@ -871,7 +1432,7 @@ class DiffPager(App):
             return
         if self._review_mode and self._parsed_lines:
             height = self.query_one(DiffView).size.height
-            self._review_line = min(len(self._parsed_lines) - 1, self._review_line + height)
+            self._move_review(height)
             self._refresh_view()
         else:
             self.query_one(DiffView).scroll_page_down()
@@ -885,8 +1446,8 @@ class DiffPager(App):
         if self._review_mode and self._parsed_lines:
             height = diff_view.size.height
             max_visible = new_scroll + height - 1
-            if self._review_line > max_visible:
-                self._review_line = max_visible
+            if self._rows_for_line(self._review_line)[0] > max_visible:
+                self._review_line = self._line_at_row(max_visible)
             self._refresh_view()
 
     def action_viewport_down(self) -> None:
@@ -896,12 +1457,15 @@ class DiffPager(App):
         new_scroll = int(diff_view.scroll_y) + 1
         diff_view.scroll_to(y=new_scroll, animate=False)
         if self._review_mode and self._parsed_lines:
-            if self._review_line < new_scroll:
-                self._review_line = new_scroll
+            if self._rows_for_line(self._review_line)[0] < new_scroll:
+                self._review_line = self._line_at_row(new_scroll)
             self._refresh_view()
 
     def action_enter_comment(self) -> None:
-        if self._comment_mode or self._on_summary_page():
+        if self._comment_mode or self._revise_mode:
+            return
+        if self._on_summary_page():
+            self._enter_revise_mode()
             return
         if not self._review_mode:
             self.action_toggle_review()
@@ -929,30 +1493,63 @@ class DiffPager(App):
         self._run_claude = True
         self.exit()
 
-    def action_copy_review(self) -> None:
-        if not self._comments and self._summary_text_override is None:
-            return
-        pyperclip.copy(self._build_summary_text())
+    def _copy_text(self, text: str) -> None:
+        # pyperclip covers the local clipboard; OSC 52 covers remote/ssh terminals
+        try:
+            pyperclip.copy(text)
+        except pyperclip.PyperclipException:
+            pass
+        self.copy_to_clipboard(text)
         self.query_one("#footer-status", Label).update("Copied to clipboard")
+
+    def on_text_selected(self, event: events.TextSelected) -> None:
+        """Copy to the clipboard whenever text is selected with the mouse."""
+        if self._comment_mode or self._revise_mode:
+            return
+        selected = self.screen.get_selected_text()
+        if selected:
+            self._copy_text(selected)
+
+    def action_copy_review(self) -> None:
+        if self._comment_mode or self._revise_mode:
+            return
+        if self._comments or self._summary_text_override is not None:
+            self._copy_text(self._build_summary_text())
+            return
+        # No review yet: copy the current line in review mode, else any selection
+        if self._review_mode and self._parsed_lines and not self._on_summary_page():
+            if self._review_line < 0:
+                self._copy_text(self.files[self._index][0])
+            else:
+                self._copy_text(self._parsed_lines[self._review_line].plain)
+            return
+        selected = self.screen.get_selected_text()
+        if selected:
+            self._copy_text(selected)
+        else:
+            self.query_one("#footer-status", Label).update("Nothing to copy")
 
     def action_quit(self) -> None:
         self.exit()
 
 
+def load_diff(diff_args: list[str]) -> tuple[str, list[tuple[str, str]], list[str]]:
+    """Run the diff (plus untracked files) -> (combined output, per-file sections, untracked paths)."""
+    diff_output = get_diff(diff_args)
+    untracked_paths = get_untracked_files(diff_args)
+    untracked_diff = "".join(get_untracked_diff(path) for path in untracked_paths)
+    combined_output = diff_output + untracked_diff
+    return combined_output, parse_diff(combined_output), untracked_paths
+
+
 def main() -> None:
     branch = get_branch()
     diff_args = sys.argv[1:]
-    diff_output = get_diff(diff_args)
-
-    untracked_paths = get_untracked_files(diff_args)
-    untracked_diff = "".join(get_untracked_diff(path) for path in untracked_paths)
-
-    combined_output = diff_output + untracked_diff
+    combined_output, files, untracked_paths = load_diff(diff_args)
     if not combined_output.strip():
         print("No diff output.")
         sys.exit(0)
 
-    files = parse_diff(combined_output)
     if not files:
         print("No files found in diff.")
         sys.exit(0)

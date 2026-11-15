@@ -47,21 +47,25 @@ pathspec`, only untracked files matching it are included.
 | `Ctrl+↑` / `Ctrl+↓` | Scroll one line |
 | `F` | Toggle full file view (expand all context) |
 | `L` | Toggle line numbers |
-| `R` | Enter review mode |
+| `S` | Toggle split (side-by-side) view |
+| `H` | Toggle syntax highlighting (turns on full file view; turning full view off turns this off) |
+| `R` | Reload the diff (re-runs the command, keeping your file and line) |
+| `Enter` / `Tab` | Enter review mode |
+| Click a line | Select it (entering review mode if needed); `Enter` then adds a comment. In split view, click either side. Dragging still selects and copies text. |
 | `W` | Save comments to `~/.git-review` (without quitting) |
 | `Q` / `Esc` | Quit |
 | `:` | Jump to file by number |
 
 ## Leaving comments
 
-Press `R` to enter review mode. The selected line is highlighted.
+Press `Enter` or `Tab` to enter review mode. The selected line is highlighted.
 
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` / `PgUp` / `PgDn` | Move selection |
 | `Ctrl+↑` / `Ctrl+↓` | Scroll viewport (selection clamps to visible area) |
 | `Enter` / `Tab` / `Space` | Open comment box for selected line |
-| `R` / `Esc` | Exit review mode |
+| `Esc` | Exit review mode |
 
 In the comment box:
 
@@ -71,10 +75,15 @@ In the comment box:
 | `Shift+Enter` | Insert newline |
 | `Ctrl+S` / `Esc` | Save comment |
 | `Ctrl+C` | Discard comment |
+| `Ctrl+P` | Send the text to Claude as a prompt about this line (doesn't save a comment) |
 
-Commenting on one of the header lines (the `diff --git` / `---` / `+++` block, before the first `@@` hunk) creates a whole-file comment with no line reference.
+For a whole-file comment, press `↑` from the first line to select the filename in the title bar, then `Enter`. A `●` next to the filename shows that the file has one. The diff header (`diff --git` / `---` / `+++`) isn't shown, and neither is the `@@` line in full-file view.
 
 Lines with comments are marked with a `●` in the margin.
+
+### Prompting Claude about a line
+
+Instead of saving the text as a comment, `Ctrl+P` sends it straight to an interactive `claude` session that takes over the terminal ("explain this", "rewrite this as ...", anything). The prompt includes the file, the old/new line numbers, the diff lines around it and the `git diff` arguments. Select the filename in the title bar first to ask about the whole file. When you quit Claude, git-review reloads the diff and returns you to the same place. Set `$CLAUDE` to use a different binary.
 
 ## Exporting
 
@@ -82,7 +91,7 @@ Once you have comments, navigate to the last file and press `→` to reach the s
 
 | Key | Action |
 |-----|--------|
-| `R` | Edit / revise the summary text |
+| `Enter` / `Tab` | Edit / revise the summary text (`Esc` to finish) |
 | `W` | Write review to `~/.git-review` and quit |
 | `C` | Copy review to clipboard |
 | `F` | Write review and launch `claude /git-review` immediately |

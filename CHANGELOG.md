@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0
+
+- **Click a line to select it** — enters review mode if needed and moves the cursor to the clicked line (either side, in split view); `Enter` still opens the comment box. Dragging to select and copy text is unaffected. Unified view now wraps long lines itself (as split view already did), so row-to-line mapping is exact: clicking and scrolling to a line now work correctly on files with wrapped lines. Wrapped continuation rows are indented under the line-number gutter.
+- **Prompt Claude about a line** — in the comment box, `Ctrl+P` sends the text to an interactive `claude` session (with the file, line numbers, surrounding diff and diff command as context) instead of saving it as a comment. Quitting Claude reloads git-review at the same file and line. With the filename in the title bar selected, the prompt is about the whole file. Textual's command palette is disabled so it doesn't claim `Ctrl+P`.
+- **Diff header hidden** — the `diff --git` / `index` / `---` / `+++` block is no longer shown, and neither is the lone `@@` line in full-file view (normal view keeps `@@` as the hunk separator). Files with no hunks (pure renames, binary changes) still show their header, since it is all there is.
+- **Whole-file comments now attach to the filename in the title bar** — in review mode press `↑` from the first line to select it, then `Enter`. It shows a `●` when the file has a whole-file comment. (This replaces commenting on the header lines.)
+- **`R` now reloads** — re-runs the diff command and returns to the same file and line (found by line number, so it still lands in the right place if lines were added above). View settings (split, highlight, full, line numbers) are kept. Comments follow their file by name; if the code moved under a comment, its saved context in the summary is what Claude works from. If no diff remains, the previous view is kept.
+- **Review mode is now entered with `Enter` / `Tab`** and left with `Esc` (`R` used to do both). On the summary page `Enter` / `Tab` edits the summary, replacing `R`.
+- **Full-file view is now sticky** — `F` stays on as you move between files instead of resetting to the normal diff on each one. Press `F` again to turn it off.
+- **Syntax highlighting** — press `H` to highlight code with pygments, using your terminal's palette. Highlighting is tied to full-file view, since hunks alone give false colours: turning `H` on also turns `F` on, and turning `F` off also turns `H` off (`F` on without `H`, and `H` off while in full view, are fine). The `+`/`-` markers keep their red/green; the rest of the line is highlighted. Each hunk is lexed as separate old and new streams so multi-line strings and docstrings highlight correctly. Falls back to git's colours for file types without a lexer. Works in unified, split and full-file views.
+- **Split view** — press `S` to toggle between unified and side-by-side diffs, in both the normal and full-file views. The old side (context + removed) is on the left, the new side (context + added) on the right. Long lines wrap within their column and the shorter side is padded with blank, unnumbered rows so the columns stay aligned. With line numbers on, each side shows its own numbering.
+
 ## 0.1.5
 
 - **Untracked files are now included in the review** — new (non-ignored) files are appended after the regular diff, synthesized against `/dev/null` so they show up as all-added content with correct line numbers, full-file view, and commenting. Respects any `-- pathspec` passed to `git review`.
